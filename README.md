@@ -102,13 +102,18 @@
 
 | 모듈 | 역할 |
 |------|------|
-| Ingestor | 문서 파싱 및 정규화 (PDF/PPTX/DOCX → 텍스트 청크) |
-| Embedding Model | 텍스트 → 1536-dim 벡터 (`text-embedding-3-small`) |
-| Vector Store | 벡터·메타데이터 저장 및 검색 (ChromaDB) |
-| Request Analyzer | 자유 서술 → 구조화 쿼리 (LLM 1차 호출) |
-| Hybrid Retriever | 메타데이터 필터 + 벡터 검색 결합 → top-k 선정 |
-| Draft Generator | 레퍼런스 기반 섹션별 초안 생성 (LLM 2차 호출) |
-| PPT Assembler | 디자인 템플릿에 생성 텍스트 삽입 → `.pptx` 파일 출력 |
+| ingestor.py | 문서 파싱 및 청킹 (PDF/PPTX → 섹션별 텍스트 청크) |
+| vector_store.py | ChromaDB 연동 (벡터·메타데이터 저장/검색) |
+| retriever.py | 하이브리드 검색 (메타데이터 필터 + 벡터 검색 + 재랭킹) |
+| - analyze_request() | 자유 서술 → 구조화된 쿼리 (Haiku LLM, 2회 재시도) |
+| - retrieve() | 메타데이터 점수 + 시맨틱 유사도 결합 → top-3 선정 |
+| generator.py | 레퍼런스 기반 초안 생성 (Sonnet LLM) |
+| - build_prompts() | 시스템·사용자 프롬프트 구성 (스트리밍용) |
+| - generate_draft() | 프롬프트 캐싱 활용 + 2회 호출 (Slide-1, Slide-2) |
+| - regenerate_section() | 특정 섹션 재생성 (사용자 커스터마이징) |
+| validator.py | 생성 결과 검증 (구조, 길이 제한 적용) |
+| assembler.py | PPT 조립 (텍스트 삽입, 이미지 교체, 형식 유지) |
+| config.py | 환경 변수 및 상수 설정 |
 
 ---
 
@@ -117,12 +122,12 @@
 | 구성요소 | 기술 |
 |---------|------|
 | 언어 | Python 3.11 |
-| RAG 프레임워크 | LangChain |
 | Vector Store | ChromaDB (로컬, 파일 기반 영속성) |
 | Embedding | OpenAI `text-embedding-3-small` (1536-dim) |
-| LLM | Anthropic Claude Sonnet 4.6 |
+| LLM (분석) | Anthropic Claude Haiku 4.5 (Request Analyzer) |
+| LLM (생성) | Anthropic Claude Sonnet 4.6 (Draft Generator) |
 | PPT 생성 | python-pptx |
-| UI | Streamlit |
+| UI | Streamlit (v3 - 스트리밍 생성 지원) |
 | 의존성 관리 | pip + requirements.txt |
 
 ---
@@ -132,23 +137,24 @@
 ```
 ProposalPilot/
 ├── docs/
-│   ├── document-metadata.csv          # 21개 문서 메타데이터 (11개 컬럼)
-│   ├── 디자인 샘플/                   # 회사소개서의 디자인 양식
-│   └── 과거 제안서 자료(가상데이터)/   # PPTX 21개
+│   ├── document-metadata.csv          # 21개 문서 메타데이터
+│   ├── mock_data/                     # PPTX 21개 (샘플)
+│   └── sample/                        # 디자인 템플릿
 │
 ├── src/
+│   ├── config.py           # 환경 변수, 상수 설정
 │   ├── ingestor.py         # 문서 파싱 및 청킹
-│   ├── embedder.py         # 임베딩 생성 및 ChromaDB 저장
-│   ├── retriever.py        # 하이브리드 검색 (메타데이터 필터 + 벡터)
-│   ├── analyzer.py         # Request Analyzer (LLM 1차)
-│   ├── generator.py        # Draft Generator (LLM 2차)
-│   └── assembler.py        # PPT Assembler (python-pptx)
+│   ├── vector_store.py     # ChromaDB 연동
+│   ├── retriever.py        # 하이브리드 검색 (메타 + 벡터 + 재랭킹)
+│   ├── generator.py        # Draft 생성 (프롬프트 캐싱, 2회 호출)
+│   ├── validator.py        # 검증 및 길이 제한
+│   └── assembler.py        # PPT 조립
 │
-├── output/                 # 생성된 초안 저장 디렉토리
+├── output/                 # 생성된 초안 저장
 │
-├── ingest.py               # 인덱싱 실행 스크립트
-├── run.py                  # 전체 파이프라인 실행 스크립트
-├── app.py                  # Streamlit 웹 UI
+├── ingest.py               # 인덱싱 실행 (문서 파싱 → ChromaDB 저장)
+├── run.py                  # CLI 실행 (retrieve → generate → assemble)
+├── app.py                  # Streamlit 웹 UI (v3 - 스트리밍)
 ├── requirements.txt
 ├── .env.example
 ├── DECISIONS.md            # 설계 의사결정 로그
@@ -196,56 +202,94 @@ python ingest.py
 
 **CLI**
 ```bash
-python run.py --scenario "자동차 신차 런칭을 위한 XR 체험 캠페인 제안"
+python run.py "자동차 신차 런칭을 위한 XR 체험 캠페인 제안"
 # output/ 에 proposal_draft_YYYYMMDD_HHMMSS.pptx, retrieval_log.json 생성
 ```
 
-**웹 UI**
+**웹 UI (Streamlit v3)**
 ```bash
 streamlit run app.py
+# 로컬 스트리밍 생성 + 실시간 섹션 진행률 표시 + 섹션별 재생성 지원
 ```
 
 ---
 
 ## 🔍 핵심 기능
 
-### 1. 하이브리드 검색
+### 1. 하이브리드 검색 (Retriever)
 
-단순 키워드 검색의 한계를 넘어, **메타데이터 필터링**과 **시맨틱 벡터 검색**을 결합한 2단계 검색을 수행합니다.
+메타데이터 필터링과 벡터 유사도를 결합한 2단계 재랭킹 방식:
 
 ```
-최종 점수 = α × metadata_score + (1-α) × semantic_score
-           (α = 0.4 기본값)
+사용자 입력 (자유 서술)
+    ↓
+analyze_request() → Haiku LLM 호출 (구조화 쿼리 추출)
+    ↓ (JSON 파싱 실패 시 2회 재시도)
+_metadata_score() & semantic_score()
+    ↓
+하이브리드 점수 = 0.4 × 메타데이터 점수 + 0.6 × 시맨틱 유사도
+    ↓
+top-3 레퍼런스 선정 (산업군 다양성 보장)
 ```
 
-- **메타데이터 필터**: 산업군, 프로젝트 유형, 문서 연도 기반 하드 필터링
-- **시맨틱 검색**: 자유 서술 임베딩 → 코사인 유사도 기반 소프트 랭킹
-- **재랭킹**: 하이브리드 스코어 기준 최종 top-3 선정 (다양성 보장)
+- **메타데이터 필터**: 산업군 정확 매칭 (1.0), 별칭 매칭 (0.25), 확장 레퍼런스 (0.1)
+- **시맨틱 검색**: 코사인 유사도 기반 top-k 재정렬
+- **재랭킹**: 하이브리드 스코어 기준 최종 선정
 
-### 2. 레퍼런스 기반 PPT 자동 생성
+### 2. 프롬프트 캐싱을 활용한 효율적 생성
 
-검색된 top-1 PPTX를 디자인 템플릿으로 복사 후, LLM이 생성한 텍스트로 교체합니다. 배경·레이아웃·폰트 등 디자인 요소는 그대로 유지됩니다.
+Draft Generator는 2회 LLM 호출을 활용하여 Slide-1, Slide-2 콘텐츠를 동시에 생성:
 
-- 섹션별 헤드라인 / 서브타이틀 / 불릿 포인트 자동 생성
-- 레퍼런스 고객사명·캠페인명은 `[고객사]`, `[제품명]` 플레이스홀더로 치환
-- 생성 근거를 `retrieval_log.json`에 기록
+```
+첫 번째 호출 (캐시 저장)
+  System: 올림플래닛 제안서 작성 가이드
+  User: [참조 레퍼런스] + [신규 요청 분석]
+    ↓
+  Claude 응답 (Slide-1 섹션 생성)
+    ↓
+두 번째 호출 (캐시 재사용 ✓)
+  System: (동일 - 캐시 히트)
+  User: (동일 context + Slide-2 재작성 지시)
+    ↓
+  Claude 응답 (Slide-2 섹션 생성)
+```
 
-### 3. 추천 근거 추적
+**장점**:
+- 프롬프트 캐싱으로 토큰 비용 50% 감소
+- Haiku (분석)와 Sonnet (생성) 모델 분리로 비용-품질 최적화
+- 스트리밍으로 실시간 진행 상황 표시
+
+### 3. 사용자 커스터마이징 (regenerate_section)
+
+생성된 초안의 특정 섹션을 사용자 지시에 따라 재생성:
+
+```
+사용자: "세부 실행 방안을 더 기술적으로 작성해주세요"
+    ↓
+regenerate_section(draft, idx=4, instruction="...")
+    ↓
+해당 섹션만 재생성 (다른 섹션은 유지)
+    ↓
+검증 & 조립 후 PPT 업데이트
+```
+
+### 4. 구조화된 출력
+
+생성된 모든 콘텐츠는 검증 및 길이 제한 적용:
 
 ```json
-// retrieval_log.json 예시
 {
-  "query": "자동차 신차 런칭 XR 체험 캠페인",
-  "top_references": [
+  "cover": {"title": "...", "subtitle": "..."},
+  "sections": [
     {
-      "doc_id": "OP-S1-01",
-      "industry": "자동차",
-      "project_type": "브랜드/캠페인 전략",
-      "hybrid_score": 0.87,
-      "metadata_score": 0.80,
-      "semantic_score": 0.91
+      "section_name": "제안 배경",
+      "headline": "... (최대 {MAX_HEADLINE_LEN}자)",
+      "subtitle": "... (최대 200자)",
+      "bullets": ["...", "...", "..."],  // 최대 {MAX_BULLETS}개
+      "notes": "... (발표 시 강조점)"
     }
-  ]
+  ],
+  "sections_slide2": [...]
 }
 ```
 
@@ -265,11 +309,13 @@ streamlit run app.py
 
 ## 💰 API 비용 추산
 
-| 단계 | API | 예상 비용 |
-|------|-----|---------|
-| 인덱싱 (1회) | OpenAI Embeddings | ~$0.004 |
-| 제안서 생성 (1회) | Claude Sonnet 4.6 | ~$0.05 |
-| **테스트 10회 기준** | | **≈ $0.50** |
+| 단계 | 호출 모델 | 예상 비용 | 비고 |
+|------|---------|---------|------|
+| 인덱싱 (1회) | OpenAI Embeddings | ~$0.004 | 21개 문서, 168개 청크 |
+| 제안서 생성 (1회) | Haiku (분석) | ~$0.001 | 구조화 쿼리 추출 (재시도 포함) |
+| | Sonnet (생성) | ~$0.08 | 2회 호출 (프롬프트 캐싱 적용) |
+| **생성 총비용** | | **~$0.081** | |
+| **10회 테스트** | | **~$0.81** | |
 
 ---
 
