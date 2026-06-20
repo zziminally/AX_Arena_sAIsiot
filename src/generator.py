@@ -59,14 +59,15 @@ _USER = """[신규 제안 요청]
   "sections": [
     {{
       "section_name": "섹션명",
+      "act_tagline": "섹션 구분 슬라이드 임팩트 카피 (20자 이내, 질문형·선언형)",
       "headline": "슬라이드 핵심 헤드라인 ({max_headline}자 이내)",
       "subtitle": "헤드라인 보완 서브타이틀 (40자 초과 시 \\n 분리)",
       "bullets": [
-        "구체적 내용 1 ({max_bullet}자 이내)",
-        "구체적 내용 2",
-        "구체적 내용 3",
-        "구체적 내용 4",
-        "구체적 내용 5"
+        "항목명: 구체적 설명 ({max_bullet}자 이내)",
+        "항목명: 구체적 설명",
+        "항목명: 구체적 설명",
+        "항목명: 구체적 설명",
+        "항목명: 구체적 설명"
       ],
       "notes": "발표자 참고 노트"
     }}
@@ -117,12 +118,124 @@ def _build_references_text(results: list, max_chars_per_section: int = 800) -> s
     return "\n\n".join(parts)
 
 
-def build_prompts(retrieve_result: Dict[str, Any]):
-    """Return (system_prompt, user_prompt) without making an API call. Used by streaming path."""
+def generate_draft(retrieve_result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Claude call → full proposal draft.
+
+    Returns:
+    {
+        "cover": {"title", "subtitle"},
+        "sections": [{"section_name", "headline", "subtitle", "bullets", "notes"}, ...],
+        "sections_slide2": [...],   # second slide content per section
+        "query": ...,
+        "references": ...
+    }
+    """
     query = retrieve_result["query"]
     results = retrieve_result["results"]
+
     references_text = _build_references_text(results)
     section_list = "\n".join(f"{i+1}. {s}" for i, s in enumerate(DEFAULT_SECTIONS))
+
+    system_prompt = _SYSTEM.format(
+        max_headline=MAX_HEADLINE_LEN,
+        max_bullet=MAX_BULLET_LEN,
+        max_bullets=MAX_BULLETS,
+    )
+    user_prompt = _USER.format(
+        industry=query.get("industry", ""),
+        client_type=query.get("client_type", ""),
+        project_type=query.get("project_type", ""),
+        proposal_purpose=query.get("proposal_purpose", ""),
+        emphasized_values=", ".join(query.get("emphasized_values", [])),
+        tone_and_manner=query.get("tone_and_manner", ""),
+        key_needs_keywords=", ".join(query.get("key_needs_keywords", [])),
+        references_text=references_text,
+        n_refs=len(results),
+        section_list=section_list,
+        max_headline=MAX_HEADLINE_LEN,
+        max_bullet=MAX_BULLET_LEN,
+        max_bullets=MAX_BULLETS,
+    )
+
+    # ④ 프롬프트 캐싱: system prompt와 references 블록을 캐시 경계로 지정.
+    #    - system prompt: 매 호출 동일 → 캐시 히트율 높음
+    #    - references 블록: 같은 top-3 문서가 재사용되면 캐시 히트
+    #    - 두 번째(slide-2) 호출은 동일 context를 재사용하므로 캐시 효과 극대화
+
+    # user_prompt를 references 부분과 나머지로 분리
+    ref_marker = "[참조 레퍼런스"
+    split_idx = user_prompt.find(ref_marker)
+    if split_idx != -1:
+        user_prompt_head = user_prompt[:split_idx].rstrip()
+        user_prompt_refs = user_prompt[split_idx:]
+    else:
+        user_prompt_head = user_prompt
+        user_prompt_refs = ""
+
+    cached_system = [{"type": "text", "text": system_prompt,
+                      "cache_control": {"type": "ephemeral"}}]
+
+    if user_prompt_refs:
+        cached_user_content = [
+            {"type": "text", "text": user_prompt_refs,
+             "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": user_prompt_head},
+        ]
+    else:
+        cached_user_content = [{"type": "text", "text": user_prompt}]
+
+    # ③ max_tokens 현실화: 8개 섹션 풀 콘텐츠 실측 ~4000-5000 토큰 → 8000으로 충분
+    msg = _client.messages.create(
+        model=LLM_MODEL,
+        max_tokens=8000,
+        system=cached_system,
+        messages=[{"role": "user", "content": cached_user_content}],
+    )
+
+    raw = msg.content[0].text.strip()
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
+    draft = json.loads(raw)
+
+    # Second call: slide-2 — 앞선 호출과 동일 system+user context → 캐시 히트
+    slide2_msg = _client.messages.create(
+        model=LLM_MODEL,
+        max_tokens=8000,
+        system=cached_system,
+        messages=[
+            {"role": "user", "content": cached_user_content},
+            {"role": "assistant", "content": raw},
+            {"role": "user", "content": _USER_SLIDE2},
+        ],
+    )
+
+    raw2 = slide2_msg.content[0].text.strip()
+    raw2 = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw2, flags=re.DOTALL).strip()
+    try:
+        draft2 = json.loads(raw2)
+        draft["sections_slide2"] = draft2.get("sections_slide2", [])
+    except json.JSONDecodeError:
+        draft["sections_slide2"] = []
+
+    # Attach metadata
+    draft["query"] = query
+    draft["references"] = [
+        {"doc_id": r["doc_id"], "score": r["score"], "industry": r["metadata"]["industry"]}
+        for r in results
+    ]
+    return draft
+
+
+def build_prompts(retrieve_result: Dict[str, Any]) -> tuple:
+    """Extract system & user prompts for streaming generation.
+    Returns: (system_prompt, user_prompt)
+    """
+    query = retrieve_result["query"]
+    results = retrieve_result["results"]
+
+    references_text = _build_references_text(results)
+    section_list = "\n".join(f"{i+1}. {s}" for i, s in enumerate(DEFAULT_SECTIONS))
+
     system_prompt = _SYSTEM.format(
         max_headline=MAX_HEADLINE_LEN,
         max_bullet=MAX_BULLET_LEN,
@@ -146,124 +259,56 @@ def build_prompts(retrieve_result: Dict[str, Any]):
     return system_prompt, user_prompt
 
 
-def generate_draft(retrieve_result: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Claude call → full proposal draft.
-
+def regenerate_section(draft: Dict[str, Any], section_idx: int,
+                      instruction: str, retrieve_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Regenerate a single section with custom instruction.
+    
+    Args:
+        draft: current draft
+        section_idx: section index (0-based)
+        instruction: user instruction for regeneration
+        retrieve_result: original retrieval result
+    
     Returns:
-    {
-        "cover": {"title", "subtitle"},
-        "sections": [{"section_name", "headline", "subtitle", "bullets", "notes"}, ...],
-        "sections_slide2": [...],   # second slide content per section
-        "query": ...,
-        "references": ...
-    }
+        updated draft
     """
     query = retrieve_result["query"]
     results = retrieve_result["results"]
+    references_text = _build_references_text(results)
+    section_list = "\n".join(f"{i+1}. {s}" for i, s in enumerate(DEFAULT_SECTIONS))
 
-    system_prompt, user_prompt = build_prompts(retrieve_result)
+    system_prompt = _SYSTEM.format(
+        max_headline=MAX_HEADLINE_LEN,
+        max_bullet=MAX_BULLET_LEN,
+        max_bullets=MAX_BULLETS,
+    )
+    
+    regen_prompt = f"""위 제안서 초안의 섹션 {section_idx + 1}을 다시 작성하세요.
 
-    # ── Call 1: main draft (with retry) ─────────────────────────────────────
-    last_err: Exception = RuntimeError("generate_draft: no attempts made")
-    raw = ""
-    draft: Dict[str, Any] = {}
-    for attempt in range(1, 4):  # up to 3 attempts
-        try:
-            msg = _client.messages.create(
-                model=LLM_MODEL,
-                max_tokens=16000,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
-            )
-            raw = msg.content[0].text.strip()
-            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
-            draft = json.loads(raw)
-            validate_draft(draft)
-            break
-        except (json.JSONDecodeError, ValueError) as e:
-            last_err = e
-            if attempt == 3:
-                raise RuntimeError(f"generate_draft failed after 3 attempts: {last_err}") from last_err
-
-    # ── Call 2: slide-2 content (best-effort, non-critical) ──────────────────
-    try:
-        slide2_msg = _client.messages.create(
-            model=LLM_MODEL,
-            max_tokens=8000,
-            system=system_prompt,
-            messages=[
-                {"role": "user", "content": user_prompt},
-                {"role": "assistant", "content": raw},
-                {"role": "user", "content": _USER_SLIDE2},
-            ],
-        )
-        raw2 = slide2_msg.content[0].text.strip()
-        raw2 = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw2, flags=re.DOTALL).strip()
-        draft2 = json.loads(raw2)
-        draft["sections_slide2"] = draft2.get("sections_slide2", [])
-    except Exception:
-        draft["sections_slide2"] = []
-
-    # ── Enforce text limits, attach metadata ─────────────────────────────────
-    enforce_limits(draft)
-    draft["query"] = query
-    draft["references"] = [
-        {"doc_id": r["doc_id"], "score": r["score"], "industry": r["metadata"]["industry"]}
-        for r in results
-    ]
-    return draft
-
-
-def regenerate_section(
-    section_name: str,
-    instruction: str,
-    current_section: Dict[str, Any],
-    retrieve_result: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Re-generate a single section based on user instruction.
-    Returns an updated section dict.
-    """
-    system_prompt, _ = build_prompts(retrieve_result)
-
-    bullets_text = "\n".join(f"- {b}" for b in current_section.get("bullets", []))
-    user_msg = f"""제안서의 [{section_name}] 섹션을 아래 지시사항에 따라 수정하십시오.
-
-[수정 지시사항]
+[재작성 요청]
 {instruction}
 
-[현재 섹션 내용 (참고)]
-headline: {current_section.get('headline', '')}
-subtitle: {current_section.get('subtitle', '')}
-bullets:
-{bullets_text}
+[현재 섹션]
+{json.dumps(draft['sections'][section_idx], ensure_ascii=False, indent=2)}
 
-[출력 형식 — JSON only, 마크다운·설명 텍스트 없이]
-{{
-  "section_name": "{section_name}",
-  "headline": "수정된 헤드라인 ({MAX_HEADLINE_LEN}자 이내)",
-  "subtitle": "수정된 서브타이틀",
-  "bullets": ["수정된 내용 1", "수정된 내용 2", "수정된 내용 3", "수정된 내용 4", "수정된 내용 5"],
-  "notes": "발표자 노트"
-}}"""
+[출력 형식]
+JSON 단일 객체: {{"section_name": "...", "headline": "...", "subtitle": "...", "bullets": [...], "notes": "..."}}
+"""
 
-    last_err: Exception = RuntimeError("no attempts")
-    for attempt in range(1, 3):
-        try:
-            msg = _client.messages.create(
-                model=LLM_MODEL,
-                max_tokens=1024,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_msg}],
-            )
-            raw = msg.content[0].text.strip()
-            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
-            sec = json.loads(raw)
-            if not sec.get("headline") or not isinstance(sec.get("bullets"), list):
-                raise ValueError("Missing required fields")
-            sec["section_name"] = section_name  # preserve original name
-            return sec
-        except Exception as e:
-            last_err = e
-    raise RuntimeError(f"섹션 재생성 실패: {last_err}") from last_err
+    msg = _client.messages.create(
+        model=LLM_MODEL,
+        max_tokens=2000,
+        system=system_prompt,
+        messages=[{"role": "user", "content": regen_prompt}],
+    )
+
+    raw = msg.content[0].text.strip()
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
+    try:
+        updated_sec = json.loads(raw)
+        enforce_limits(updated_sec)
+        draft["sections"][section_idx] = updated_sec
+    except (json.JSONDecodeError, ValueError) as e:
+        raise RuntimeError(f"Failed to regenerate section {section_idx}: {e}") from e
+
+    return draft

@@ -8,12 +8,13 @@ Flow:
 """
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional
 
 import anthropic
 
 from src.config import (
-    ANTHROPIC_API_KEY, LLM_MODEL,
+    ANTHROPIC_API_KEY, LLM_MODEL, ANALYZER_MODEL,
     TOP_K, FINAL_TOP_K, ALPHA,
 )
 from src.validator import validate_query
@@ -70,7 +71,9 @@ _ANALYZER_USER = """[신규 제안 요청]
   "key_needs_keywords": ["핵심 니즈 키워드 3~7개"],
   "emphasized_values": ["강조 가치 2~4개"],
   "tone_and_manner": "톤앤매너 (위 패턴 중 가장 가까운 것)",
-  "query_text": "벡터 검색용 핵심 요약 (2~3문장, 산업군+캠페인 목적+체험 방식 포함)"
+  "query_text": "벡터 검색용 핵심 요약 (2~3문장, 산업군+캠페인 목적+체험 방식 포함)",
+  "client_name": "고객사 짧은 식별자 (2~5자, 예: 현대자동차→현대, 삼성전자→삼성. 입력에서 특정 회사명을 알 수 없으면 산업군 기반으로 표현 예: 식음료 대기업)",
+  "product_name": "제품·브랜드명 (2~5자, 알 수 없으면 '신제품' 또는 '신규 브랜드')"
 }}"""
 
 
@@ -80,7 +83,7 @@ def analyze_request(user_input: str, max_retries: int = 2) -> Dict[str, Any]:
     for attempt in range(1, max_retries + 2):
         try:
             msg = _client.messages.create(
-                model=LLM_MODEL,
+                model=ANALYZER_MODEL,
                 max_tokens=1024,
                 messages=[{
                     "role": "user",
@@ -102,20 +105,12 @@ def analyze_request(user_input: str, max_retries: int = 2) -> Dict[str, Any]:
 
 # ── Hybrid Scoring ────────────────────────────────────────────────────────────
 
-def _soft_keyword_match(q: str, d: str) -> bool:
-    """True if q and d share at least one whitespace-split token, or one contains the other."""
-    if q == d or q in d or d in q:
-        return True
-    return bool(set(q.split()) & set(d.split()))
-
-
 def _metadata_score(doc_meta: Dict, query: Dict) -> float:
     """
     Weighted metadata match score [0, 1].
-    - industry       (0.50): exact=0.5, alias=0.25, 확장레퍼런스=0.1
-    - project_type   (0.25): keyword overlap ratio
-    - key_needs      (0.15): soft token-level overlap ratio
-    - tone_and_manner(0.10): token overlap ratio
+    - industry (0.5):  exact=0.5, alias=0.25, 확장레퍼런스=0.1
+    - project_type (0.3): keyword overlap ratio
+    - key_needs_keywords (0.2): query∩doc overlap ratio
     """
     score = 0.0
     q_industry = query.get("industry", "")
@@ -138,23 +133,13 @@ def _metadata_score(doc_meta: Dict, query: Dict) -> float:
         q_kw |= PROJECT_TYPE_KEYWORDS.get(t.strip(), set())
     d_kw = PROJECT_TYPE_KEYWORDS.get(doc_meta.get("project_type", ""), set())
     if q_kw:
-        score += 0.25 * len(q_kw & d_kw) / len(q_kw)
+        score += 0.3 * len(q_kw & d_kw) / len(q_kw)
 
-    # Key needs keywords — soft token-level matching
-    q_needs = list(query.get("key_needs_keywords", []))
-    d_needs = doc_meta.get("key_needs_keywords", "").split("|")
+    # Key needs keywords
+    q_needs = set(query.get("key_needs_keywords", []))
+    d_needs = set(doc_meta.get("key_needs_keywords", "").split("|"))
     if q_needs:
-        matches = sum(1 for q in q_needs if any(_soft_keyword_match(q, d) for d in d_needs))
-        score += 0.15 * matches / len(q_needs)
-
-    # Tone-and-manner token overlap
-    q_tone = query.get("tone_and_manner", "")
-    d_tone = doc_meta.get("tone_and_manner", "")
-    if q_tone and d_tone:
-        q_tokens = set(q_tone.replace("·", " ").split())
-        d_tokens = set(d_tone.replace("·", " ").split())
-        tone_sim = len(q_tokens & d_tokens) / len(q_tokens) if q_tokens else 0.0
-        score += 0.10 * tone_sim
+        score += 0.2 * len(q_needs & d_needs) / len(q_needs)
 
     return min(score, 1.0)
 
@@ -168,29 +153,34 @@ def _hybrid_score(semantic: float, metadata: float) -> float:
 def retrieve(user_input: str) -> Dict[str, Any]:
     """
     Full retrieval pipeline.
-    Returns:
-        {
-          "query": structured query dict,
-          "results": [
-            {
-              "doc_id": ...,
-              "score": hybrid_score,
-              "semantic_score": ...,
-              "metadata_score": ...,
-              "best_section": section_name,
-              "sections": [{ "section_name", "text", "semantic_score" }, ...]
-            },
-            ...
-          ]
-        }
+    ⑤ analyzer(Haiku)와 초기 벡터 검색을 ThreadPoolExecutor로 병렬 실행.
+       - 초기 검색: user_input 원문으로 임베딩 → 빠르게 후보 확보
+       - analyzer 완료 후: query_text로 정밀 검색 (refined)
+       두 결과를 합산해 중복 제거 후 hybrid scoring에 사용.
     """
-    # Step 1: Analyze request
-    query = analyze_request(user_input)
+    # Step 1+2: analyzer와 초기 검색 병렬 실행
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_query = pool.submit(analyze_request, user_input)
+        future_hits  = pool.submit(search, user_input, TOP_K * 3)
+        query    = future_query.result()
+        initial_hits = future_hits.result()
 
-    # Step 2: Semantic search (exclude company profile from main retrieval)
-    raw_hits = search(query["query_text"], n_results=TOP_K * 3)
+    # Step 2b: analyzer의 query_text로 정밀 검색 (user_input과 다를 때만)
+    if query["query_text"].strip() != user_input.strip():
+        refined_hits = search(query["query_text"], n_results=TOP_K * 3)
+    else:
+        refined_hits = []
 
-    # Step 3: Aggregate by doc_id — collect all section hits
+    # 두 결과 합산 (chunk_id 기준 중복 제거, refined 우선)
+    seen: set = set()
+    raw_hits: list = []
+    for hit in refined_hits + initial_hits:
+        chunk_id = hit["metadata"].get("doc_id", "") + hit["metadata"].get("section_name", "")
+        if chunk_id not in seen:
+            seen.add(chunk_id)
+            raw_hits.append(hit)
+
+    # Step 3: Aggregate by doc_id (max pooling per document)
     doc_map: Dict[str, Dict] = {}
     for hit in raw_hits:
         m = hit["metadata"]
@@ -199,29 +189,21 @@ def retrieve(user_input: str) -> Dict[str, Any]:
             continue
         if doc_id not in doc_map:
             doc_map[doc_id] = {
-                "doc_id":   doc_id,
-                "metadata": m,
-                "sections": [],
+                "doc_id":         doc_id,
+                "metadata":       m,
+                "semantic_score": hit["semantic_score"],
+                "sections":       [],
             }
+        else:
+            # Keep highest semantic score
+            if hit["semantic_score"] > doc_map[doc_id]["semantic_score"]:
+                doc_map[doc_id]["semantic_score"] = hit["semantic_score"]
+                doc_map[doc_id]["metadata"] = m
         doc_map[doc_id]["sections"].append({
-            "section_name":   m["section_name"],
-            "text":           hit["text"],
+            "section_name":  m["section_name"],
+            "text":          hit["text"],
             "semantic_score": hit["semantic_score"],
         })
-
-    # Compute doc-level semantic score as mean of top-2 section scores
-    # (more robust than max-pooling: prevents a single section spike from dominating)
-    for doc in doc_map.values():
-        top_scores = sorted([s["semantic_score"] for s in doc["sections"]], reverse=True)
-        doc["semantic_score"] = sum(top_scores[:2]) / min(2, len(top_scores))
-        # Keep best-metadata section as representative
-        best = max(doc["sections"], key=lambda s: s["semantic_score"])
-        doc["metadata"] = next(
-            (hit["metadata"] for hit in raw_hits
-             if hit["metadata"]["doc_id"] == doc["doc_id"]
-             and hit["metadata"]["section_name"] == best["section_name"]),
-            doc["metadata"],
-        )
 
     # Step 4: Hybrid scoring & re-rank
     scored: List[Dict] = []

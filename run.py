@@ -30,13 +30,36 @@ def main(user_input: str) -> None:
         print(f"    [{r['doc_id']}] {r['metadata']['industry']:8s} | "
               f"score={r['score']} | {r['best_section']}")
 
-    # ── Step 2: Generate draft ─────────────────────────────────────────────
-    print("\n[2/3] 제안서 초안 생성 중...")
-    try:
-        draft = generate_draft(result)
-    except Exception as e:
-        print(f"  [오류] 초안 생성 실패: {e}")
-        sys.exit(1)
+# ── Step 2: Generate draft ─────────────────────────────────────────────
+print("\n[2/3] 제안서 초안 생성 중...")
+try:
+    draft = generate_draft(result)
+        
+    # [고객사]/[제품명] placeholder 교체
+    # analyzer가 "[고객사]" 자체를 반환할 경우도 방어
+    import re as _re
+    _ph = _re.compile(r"^\[.+\]$")
+
+    def _safe(val: str, fallback: str) -> str:
+        val = (val or "").strip()
+        return fallback if (not val or _ph.match(val)) else val
+
+    client_name  = _safe(q.get("client_name",  ""), q.get("industry", "고객사") + " 대기업")
+    product_name = _safe(q.get("product_name", ""), "신규 브랜드")
+
+    def _sub(text: str) -> str:
+        return text.replace("[고객사]", client_name).replace("[제품명]", product_name)
+
+    draft["cover"]["title"]    = _sub(draft["cover"].get("title", ""))
+    draft["cover"]["subtitle"] = _sub(draft["cover"].get("subtitle", ""))
+    for sec in draft.get("sections", []) + draft.get("sections_slide2", []):
+        for field in ("act_tagline", "headline", "subtitle", "notes"):
+            if field in sec:
+                sec[field] = _sub(sec[field])
+        sec["bullets"] = [_sub(b) for b in sec.get("bullets", [])]
+except Exception as e:
+    print(f"  [오류] 초안 생성 실패: {e}")
+    sys.exit(1)
     print(f"  표지: {draft['cover']['title']}")
     print(f"  섹션 수: {len(draft.get('sections', []))}")
     for s in draft.get("sections", []):
@@ -44,14 +67,19 @@ def main(user_input: str) -> None:
         print(f"    [{s['section_name']}] headline={bool(s.get('headline'))} "
               f"subtitle={bool(s.get('subtitle'))} bullets={bullets_count}")
 
-    # ── Step 3: Assemble PPT ───────────────────────────────────────────────
-    print("\n[3/3] PPT 조립 중...")
-    try:
-        template_path = str(Path(result["results"][0]["metadata"]["file_path"]))
-        output_path = assemble(draft, template_path)
-    except Exception as e:
-        print(f"  [오류] PPT 조립 실패: {e}")
-        sys.exit(1)
+# ── Step 3: Assemble PPT ───────────────────────────────────────────────
+print("\n[3/3] PPT 조립 중...")
+try:
+    stored_path = Path(result["results"][0]["metadata"]["file_path"])
+    if stored_path.exists():
+        template_path = str(stored_path)
+    else:
+        from src.config import PROPOSALS_DIR
+        template_path = str(PROPOSALS_DIR / stored_path.name)
+    output_path = assemble(draft, template_path)
+except Exception as e:
+    print(f"  [오류] PPT 조립 실패: {e}")
+    sys.exit(1)
     print(f"  저장: {output_path}")
 
     # ── Save full retrieval log ────────────────────────────────────────────
@@ -64,7 +92,7 @@ def main(user_input: str) -> None:
         "sections":       draft.get("sections", []),
         "sections_slide2": draft.get("sections_slide2", []),
     }
-    log_path.write_text(json.dumps(log, ensure_ascii=False, indent=2))
+    log_path.write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"  로그:  {log_path}")
 
     elapsed = time.time() - t0
