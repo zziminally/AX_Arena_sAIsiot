@@ -61,4 +61,75 @@
 **소요 시간**: 약 45분  
 **다음 단계**: Phase 2 — Hybrid Retriever (메타데이터 필터 + 시맨틱 점수 결합)
 
+---
+
+## [2026-06-20] Phase 2 완료 — Hybrid Retriever
+
+**단계**: Phase 2  
+**시도한 것**: LLM Request Analyzer + 메타데이터 스코어링 + ChromaDB 시맨틱 검색 결합  
+**결과**: 성공
+
+**설계 포인트**:
+- Request Analyzer (Claude): 자유 텍스트 → 구조화 JSON (industry, project_type, key_needs_keywords 등)
+- 메타데이터 스코어: industry 정확일치 0.5 / 별칭 0.25 / 확장레퍼런스 0.1 + project_type 키워드 overlap × 0.3
+- 하이브리드 = 0.4 × metadata + 0.6 × semantic (cosine 기반)
+- 동일 project_type 최대 2개 슬롯 — 다양성 캡 적용
+
+**시행착오**:
+- `max_tokens=512` → JSON 절단. `max_tokens=1024`로 수정
+- INDUSTRY_ALIASES에 CSV 실제값("자동차 제조 기업", "프리미엄 가전 브랜드" 등) 수동 추가 필요
+
+**소요 시간**: 약 30분  
+**다음 단계**: Phase 3 — Draft Generator + PPT Assembler
+
+---
+
+## [2026-06-20] Phase 3 완료 — Draft Generator + PPT Assembler
+
+**단계**: Phase 3  
+**시도한 것**: Claude 단일 호출 8섹션 JSON 생성 → 검색된 PPTX 복사 후 텍스트 교체  
+**결과**: 성공 (3개 검증 시나리오 모두 PPTX 출력 확인)
+
+**검증 시나리오 결과**:
+
+| 시나리오 | 참조 문서 (Top-1) | 생성 파일 | 처리 시간 |
+|---------|------------------|----------|----------|
+| 자동차 XR | OP-S1-03 | draft_신차_출시_XR_통합_체험_마케팅_전략_제안서.pptx | ~73s |
+| 가전 hybrid | OP-S2-03 | draft__고객사__프리미엄_가전_신제품_체험_마케팅_전략_제안서.pptx | ~70s |
+| 식음료 popup | OP-S3-01 | draft__고객사___제품명__신규_브랜드_런칭_체험_마케팅_전략_제안.pptx | ~70s |
+
+**검색 정확도 확인**:
+- 자동차 XR → 자동차 산업 문서 3개 중 2개(OP-S1-03, OP-S1-01) + 확장 레퍼런스(OP-S4-02) 혼합 ✓
+- 가전 hybrid → 가전 산업 문서 2개(OP-S2-03, OP-S2-01) + 확장 레퍼런스(OP-S4-02) ✓
+- 식음료 popup → 식음료 산업 문서 3개(OP-S3-01, OP-S3-02, OP-S3-03) 완전 매칭 ✓
+
+**시행착오**:
+- `prs.slides[i]` → `AttributeError: 'list' object has no attribute 'rId'`. `for slide in prs.slides` 이터레이션으로 수정
+- 텍스트 교체 시 기존 `<a:r>` 노드 수 불일치 → lxml로 `<a:p>` 전체 삭제 후 재삽입
+- 섹션명 매칭 실패 케이스: 정확 매칭 + 부분 매칭(in 연산) 2단계 폴백 적용
+- 처리 시간 ~70s (목표 ≤3분 충족) — 주로 API 호출 2회 합산
+
+**소요 시간**: 약 60분  
+**다음 단계**: Phase 4 — Streamlit Web UI
+
+---
+
+## [2026-06-20] Phase 4 완료 — Streamlit Web UI
+
+**단계**: Phase 4  
+**시도한 것**: `app.py` — Streamlit 기반 웹 UI 구현  
+**결과**: 성공 (http://localhost:8501 정상 서빙 확인)
+
+**구현 기능**:
+- 자유 텍스트 입력 폼 + 예시 시나리오 버튼 3종 (자동차 XR / 가전 hybrid / 식음료 popup)
+- "제안서 생성" 버튼 → `retrieve → generate_draft → assemble` 파이프라인 실행
+- `st.status()` 진행 표시 (3단계: 검색 / 초안 생성 / PPT 파일 생성)
+- 검색 결과 패널: Top-3 레퍼런스 카드 (Hybrid/Semantic/Metadata 점수 + 섹션 텍스트 미리보기)
+- 초안 미리보기 패널: 표지 + 8섹션 (헤드라인 / 서브타이틀 / 불릿 / 발표 노트)
+- PPTX 다운로드 버튼 (브라우저 직접 다운로드)
+- 처리 시간 표시 / 요청 분석 상세 expander
+
+**소요 시간**: 약 20분  
+**처리 시간 측정**: ~70초 (목표 ≤3분 충족)
+
 <!-- 이후 개발 과정은 아래에 추가 -->
