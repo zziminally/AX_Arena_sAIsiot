@@ -14,7 +14,7 @@ import anthropic
 import streamlit as st
 
 from src.config import ANTHROPIC_API_KEY, LLM_MODEL
-from src.retriever import retrieve
+from src.retriever import retrieve, explain_recommendation
 from src.generator import build_prompts, _USER_SLIDE2, regenerate_section
 from src.validator import validate_draft, enforce_limits
 from src.assembler import assemble
@@ -23,7 +23,7 @@ from src.assembler import assemble
 
 st.set_page_config(
     page_title="ProposalPilot — 올림플래닛",
-    page_icon="🚀",
+    page_icon="◎",
     layout="wide",
 )
 
@@ -70,6 +70,7 @@ _DEFAULTS = {
     # preview
     "preview_initialized": False,
     "regen_pending": None,
+    "regen_last": -1,
 }
 
 for _k, _v in _DEFAULTS.items():
@@ -130,45 +131,101 @@ def _render_idle():
             disabled=not (user_input or "").strip(),
             use_container_width=True,
         ):
-            st.session_state.phase = "generating"
+            st.session_state.phase = "recommend"
             st.rerun()
+
+
+# ── Phase: RECOMMEND ──────────────────────────────────────────────────────────
+
+def _render_recommend():
+    # First entry: run retrieve
+    if st.session_state.retrieve_result is None:
+        st.subheader("레퍼런스 탐색 중...")
+        with st.spinner("요청을 분석하고 가장 적합한 과거 제안서를 탐색하고 있습니다..."):
+            try:
+                result = retrieve(st.session_state.proposal_input)
+                st.session_state.retrieve_result = result
+            except Exception as e:
+                st.error(f"검색 오류: {e}")
+                if st.button("처음으로 돌아가기", key="recommend_error_back"):
+                    _reset()
+                    st.rerun()
+                return
+        st.rerun()
+        return
+
+    rr = st.session_state.retrieve_result
+    q = rr["query"]
+
+    # ── 전환 중: 카드 숨기고 loading 화면만 표시 후 generating으로 이동 ─────────
+    if st.session_state.get("_going_to_generate"):
+        st.session_state["_going_to_generate"] = False
+        st.session_state.phase = "generating"
+        st.subheader("초안 생성 중...")
+        st.progress(0.0, text="섹션 0 / 8 완성")
+        st.rerun()
+        return
+
+    col_h, col_btn = st.columns([4, 1])
+    with col_h:
+        st.subheader("추천 레퍼런스")
+        st.caption(
+            f"분석 결과 — 산업군: **{q['industry']}** | "
+            f"프로젝트 유형: **{q['project_type']}** | "
+            f"톤앤매너: {q.get('tone_and_manner', '')}"
+        )
+    with col_btn:
+        if st.button("↩ 처음으로", use_container_width=True):
+            _reset()
+            st.rerun()
+
+    st.divider()
+
+    for rank, r in enumerate(rr["results"], 1):
+        m = r["metadata"]
+        with st.container(border=True):
+            col_rank, col_meta, col_score = st.columns([1, 5, 2])
+            with col_rank:
+                st.markdown(f"### **#{rank}**")
+            with col_meta:
+                file_name = Path(m.get("file_path", r["doc_id"])).stem.replace("-", " ")
+                st.markdown(f"**{file_name}**")
+                st.caption(f"{r['doc_id']} · {m['industry']} · {m['project_type']}")
+            with col_score:
+                st.metric("종합 점수", f"{r['score']:.3f}")
+            st.markdown(explain_recommendation(q, r))
+
+    st.divider()
+    if st.button(
+        "이 추천으로 PPT 초안 생성 →",
+        type="primary",
+        use_container_width=True,
+    ):
+        st.session_state["_going_to_generate"] = True
+        st.rerun()
 
 
 # ── Phase: GENERATING ─────────────────────────────────────────────────────────
 
 def _render_generating():
-    # ── First entry: retrieve + start thread ──────────────────────────────────
+    # ── First entry: start gen thread (retrieve already done in recommend phase) ─
     if not st.session_state.gen_started:
-        with st.status("레퍼런스 검색 중...", expanded=True) as s:
-            try:
-                result = retrieve(st.session_state.proposal_input)
-                st.session_state.retrieve_result = result
-                q = result["query"]
-                s.update(
-                    label=f"검색 완료 — {q['industry']} / {q['project_type'][:25]}",
-                    state="complete",
-                )
-            except Exception as e:
-                s.update(label="검색 실패", state="error")
-                st.error(f"레퍼런스 검색 오류: {e}")
-                if st.button("처음으로"):
-                    _reset()
-                    st.rerun()
-                return
+        st.subheader("초안 생성 중...")
+        st.progress(0.0, text="섹션 0 / 8 완성")
+        with st.spinner("Claude가 제안서를 작성하고 있습니다..."):
+            sp, up = build_prompts(st.session_state.retrieve_result)
+            stop_ev = threading.Event()
+            q = queue.Queue()
+            t = threading.Thread(target=_gen_thread, args=(sp, up, q, stop_ev), daemon=True)
+            t.start()
 
-        sp, up = build_prompts(st.session_state.retrieve_result)
-        stop_ev = threading.Event()
-        q = queue.Queue()
-        t = threading.Thread(target=_gen_thread, args=(sp, up, q, stop_ev), daemon=True)
-        t.start()
-
-        st.session_state.gen_started      = True
-        st.session_state.gen_thread       = t
-        st.session_state.gen_queue        = q
-        st.session_state.gen_stop         = stop_ev
-        st.session_state.gen_system_prompt = sp
-        st.session_state.gen_user_prompt   = up
-        st.session_state.stream_raw        = ""
+            st.session_state.gen_started      = True
+            st.session_state.gen_thread       = t
+            st.session_state.gen_queue        = q
+            st.session_state.gen_stop         = stop_ev
+            st.session_state.gen_system_prompt = sp
+            st.session_state.gen_user_prompt   = up
+            st.session_state.stream_raw        = ""
         st.rerun()
         return
 
@@ -331,11 +388,12 @@ def _render_preview():
     draft = st.session_state.draft
 
     # ── Handle pending AI section regen ──────────────────────────────────────
-    regen = st.session_state.pop("regen_pending", None)
+    regen = st.session_state.get("regen_pending")
     if regen:
+        st.session_state["regen_pending"] = None
         i, instruction = regen
         sec = draft["sections"][i]
-        with st.spinner(f"[{sec['section_name']}] 재생성 중..."):
+        with st.spinner(f"[{sec['section_name']}] AI 재생성 중... (10~20초 소요)"):
             try:
                 new_sec = regenerate_section(
                     sec["section_name"], instruction, sec,
@@ -345,7 +403,8 @@ def _render_preview():
                 st.session_state[f"edit_headline_{i}"] = new_sec.get("headline", "")
                 st.session_state[f"edit_subtitle_{i}"] = new_sec.get("subtitle", "")
                 st.session_state[f"edit_bullets_{i}"]  = "\n".join(new_sec.get("bullets", []))
-                st.toast(f"[{sec['section_name']}] 재생성 완료")
+                st.session_state["regen_last"] = i
+                st.success(f"[{sec['section_name']}] 재생성 완료 — 아래 섹션에서 결과를 확인하세요.")
             except Exception as e:
                 st.error(f"재생성 실패: {e}")
 
@@ -369,8 +428,11 @@ def _render_preview():
         st.text_input("부제목", key="edit_cover_subtitle")
 
     # ── Sections ──────────────────────────────────────────────────────────────
+    regen_last = st.session_state.get("regen_last", -1)
     for i, sec in enumerate(draft.get("sections", [])):
-        with st.expander(f"**{i+1}. {sec['section_name']}**", expanded=False):
+        is_regen = (i == regen_last)
+        label = f"**{i+1}. {sec['section_name']}**" + (" 재생성됨" if is_regen else "")
+        with st.expander(label, expanded=is_regen):
             c1, c2 = st.columns([2, 1])
             with c1:
                 st.text_input("헤드라인", key=f"edit_headline_{i}")
@@ -382,6 +444,7 @@ def _render_preview():
                 )
             with c2:
                 st.markdown("**AI 재생성**")
+                st.caption("수정 지시사항을 입력하고 재생성 버튼을 누르세요.")
                 instr = st.text_area(
                     "수정 지시사항",
                     key=f"regen_instr_{i}",
@@ -389,36 +452,34 @@ def _render_preview():
                     placeholder="예) 더 구체적인 실행 방안 위주로 작성해줘",
                     label_visibility="collapsed",
                 )
-                if st.button("재생성", key=f"regen_btn_{i}", use_container_width=True):
+                if st.button("AI 재생성", key=f"regen_btn_{i}", use_container_width=True):
                     if (instr or "").strip():
                         st.session_state["regen_pending"] = (i, instr.strip())
+                        st.session_state["regen_last"] = -1
                         st.rerun()
                     else:
                         st.warning("지시사항을 입력하세요.")
 
-    # ── Finalize ──────────────────────────────────────────────────────────────
+    # ── Save & Finalize ────────────────────────────────────────────────────────
     st.divider()
-    st.subheader("검색된 레퍼런스")
-    rr = st.session_state.retrieve_result
-    ref_cols = st.columns(len(rr["results"]))
-    for col, r in zip(ref_cols, rr["results"]):
-        with col:
-            m = r["metadata"]
-            st.metric(r["doc_id"], f"score {r['score']}")
-            st.caption(f"{m['industry']} · {m['project_type']}")
-
-    st.divider()
-    if st.button("최종 PPT 생성", type="primary", use_container_width=True):
-        _collect_widgets_to_draft()
-        with st.spinner("PPT 조립 중..."):
-            try:
-                template_path = str(Path(rr["results"][0]["metadata"]["file_path"]))
-                output_path = assemble(st.session_state.draft, template_path)
-                st.session_state.output_path = str(output_path)
-                st.session_state.phase = "done"
-                st.rerun()
-            except Exception as e:
-                st.error(f"PPT 생성 오류: {e}")
+    col_save, col_gen = st.columns([1, 2])
+    with col_save:
+        if st.button("수정 내용 저장", use_container_width=True):
+            _collect_widgets_to_draft()
+            st.success("수정 내용이 저장되었습니다. '최종 PPT 생성'을 눌러 완성하세요.")
+    with col_gen:
+        rr = st.session_state.retrieve_result
+        if st.button("최종 PPT 생성 →", type="primary", use_container_width=True):
+            _collect_widgets_to_draft()
+            with st.spinner("PPT 조립 중..."):
+                try:
+                    template_path = str(Path(rr["results"][0]["metadata"]["file_path"]))
+                    output_path = assemble(st.session_state.draft, template_path)
+                    st.session_state.output_path = str(output_path)
+                    st.session_state.phase = "done"
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"PPT 생성 오류: {e}")
 
 
 # ── Phase: DONE ───────────────────────────────────────────────────────────────
@@ -438,14 +499,24 @@ def _render_done():
         use_container_width=True,
     )
 
-    # Summary
+    # Proposal outline
     draft = st.session_state.draft
-    st.markdown(f"### {draft['cover']['title']}")
-    st.caption(draft['cover'].get('subtitle', ''))
+    st.divider()
+    st.subheader("제안서 초안")
+    st.markdown(f"## {draft['cover']['title']}")
+    subtitle = draft['cover'].get('subtitle', '').replace('\\n', ' ')
+    if subtitle:
+        st.markdown(f"*{subtitle}*")
 
-    with st.expander("섹션 목록"):
-        for sec in draft.get("sections", []):
-            st.markdown(f"**{sec['section_name']}** — {sec.get('headline', '')}")
+    st.markdown("---")
+    for i, sec in enumerate(draft.get("sections", []), 1):
+        st.markdown(f"**{i}. {sec['section_name']}**")
+        headline = sec.get("headline", "")
+        if headline:
+            st.markdown(f"> {headline}")
+        for bullet in sec.get("bullets", []):
+            st.markdown(f"- {bullet}")
+        st.markdown("")
 
     st.divider()
     if st.button("새 제안서 생성", use_container_width=True):
@@ -456,11 +527,12 @@ def _render_done():
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 st.title("ProposalPilot")
-st.caption("올림플래닛 AI 제안서 생성 시스템 · Powered by Claude + OpenAI Embeddings")
+st.caption("올림플래닛 AI 제안서 생성 시스템")
 st.divider()
 
 phase = st.session_state.phase
 if   phase == "idle":       _render_idle()
+elif phase == "recommend":  _render_recommend()
 elif phase == "generating": _render_generating()
 elif phase == "preview":    _render_preview()
 elif phase == "done":       _render_done()

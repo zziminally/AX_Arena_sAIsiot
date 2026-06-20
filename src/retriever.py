@@ -235,3 +235,85 @@ def retrieve(user_input: str) -> Dict[str, Any]:
             break
 
     return {"query": query, "results": final}
+
+
+def explain_recommendation(query: Dict[str, Any], result: Dict[str, Any]) -> str:
+    """Return a detailed markdown explanation for why this document was recommended."""
+    m = result["metadata"]
+    q_industry = query.get("industry", "")
+    doc_industry = m.get("industry", "")
+    score = result["score"]
+    sem = result["semantic_score"]
+    meta_s = result["metadata_score"]
+
+    grade = "최상위 매칭" if score >= 0.75 else "높은 적합도" if score >= 0.60 else "중간 적합도" if score >= 0.45 else "참고 가능"
+
+    lines: List[str] = []
+
+    # Score overview
+    lines.append(
+        f"**종합 유사도 {score:.3f}** ({grade}) &nbsp;|&nbsp; "
+        f"내용 유사도 {sem:.3f} &nbsp;|&nbsp; 메타데이터 적합도 {meta_s:.3f}"
+    )
+    lines.append("")
+
+    # Industry match — most impactful signal (weight 0.5)
+    if doc_industry == q_industry:
+        lines.append(
+            f"**산업군 완전 일치 ({doc_industry})** — "
+            f"메타데이터 점수의 50%를 차지하는 최우선 신호로, 요청하신 '{q_industry}' 산업의 "
+            f"실제 올림플래닛 납품 제안서입니다. 동일 산업의 고객 특성·경쟁 환경·구매 의사결정 구조가 "
+            f"그대로 반영되어 있어 전략 프레임을 직접 재사용할 수 있습니다."
+        )
+    elif doc_industry == "확장 레퍼런스":
+        lines.append(
+            "**XR 전문 확장 레퍼런스** — "
+            "산업군은 다르지만 올림플래닛의 핵심 XR·이머시브 체험 설계 방법론이 집약된 문서입니다. "
+            "공간 기획, 인터랙션 플로우, 콘텐츠 연출 측면에서 산업 무관하게 직접 활용 가능한 "
+            "베스트 프랙티스가 포함되어 있습니다."
+        )
+    else:
+        lines.append(
+            f"**유사 산업군 참조 ({doc_industry})** — "
+            f"요청 산업({q_industry})과 인접한 분야의 제안서입니다. 소비자 접점 전략·체험 마케팅 "
+            f"실행 구조가 유사하여 전략 골격과 섹션 구성을 참고할 수 있으나, "
+            f"산업 특수성(규제·채널·고객군)은 신규 제안서에서 별도 반영이 필요합니다."
+        )
+
+    # Project type keyword overlap
+    q_kw: set = set()
+    for t in query.get("project_type", "").split(","):
+        q_kw |= PROJECT_TYPE_KEYWORDS.get(t.strip(), set())
+    d_kw = PROJECT_TYPE_KEYWORDS.get(m.get("project_type", ""), set())
+    common = sorted(q_kw & d_kw)
+    if common:
+        lines.append(
+            f"**전략 키워드 {len(common)}개 일치** ({', '.join(common[:5])}) — "
+            f"요청하신 프로젝트 유형({query.get('project_type', '').strip()})과 "
+            f"이 문서의 접근 방식({m.get('project_type', '')})이 실행 레벨에서 직접 겹칩니다. "
+            f"키워드 일치 수({len(common)})가 많을수록 세부 실행 방안을 더 많이 재활용할 수 있습니다."
+        )
+    else:
+        lines.append(
+            f"**프로젝트 유형** ({m.get('project_type', '')}) — "
+            f"요청과 실행 방식은 다르지만, 제안서의 논리 전개 방식과 "
+            f"섹션 구조를 구성 참고용으로 활용할 수 있습니다."
+        )
+
+    # Proposal purpose
+    purpose = m.get("proposal_purpose", "")
+    if purpose:
+        lines.append(f"**이 제안서의 목적** — {purpose}")
+
+    # Top relevant sections with scores
+    top_secs = sorted(result.get("sections", []), key=lambda s: -s["semantic_score"])[:3]
+    if top_secs:
+        sec_parts = " / ".join(
+            f"'{s['section_name']}'({s['semantic_score']:.3f})" for s in top_secs
+        )
+        lines.append(
+            f"**내용 유사도 상위 섹션** — {sec_parts}. "
+            f"유사도 수치가 높을수록 해당 섹션의 논리 구조·표현 방식을 신규 제안서에 직접 반영합니다."
+        )
+
+    return "\n\n".join(lines)
