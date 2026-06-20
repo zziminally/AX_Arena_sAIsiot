@@ -30,4 +30,35 @@
 
 ---
 
+---
+
+## [2026-06-20] Phase 0 완료 — 환경 설정
+
+**단계**: Phase 0  
+**시도한 것**: venv(Python 3.11) 확인 후 requirements.txt 작성 및 패키지 설치  
+**결과**: 성공  
+**설치 패키지**: anthropic, openai, langchain + langchain-openai/anthropic/community, chromadb, python-pptx, streamlit, python-dotenv, pandas  
+**확인 사항**: `import` 전체 OK, `.env` API 키 양쪽 설정 확인, 데이터 경로(`docs/`) 접근 정상  
+**소요 시간**: 약 10분  
+**다음 단계**: Phase 1 — PPTX 파싱 + CSV 로딩 + ChromaDB 인덱싱
+
+---
+
+## [2026-06-20] Phase 1 완료 — 인덱싱 파이프라인
+
+**단계**: Phase 1  
+**시도한 것**: PPTX 파싱 → 섹션 단위 청킹 → ChromaDB 인덱싱  
+**결과**: 성공 (171청크 / 21문서, 6초)
+
+**시행착오**:
+- PPTX 파일 두 가지 섹션 구분 스타일 발견: `"01 제안 배경..."` vs `"ACT 02"` 코드형
+  - 원인: 섹션명을 구분 슬라이드 텍스트에서 추출했는데 일부 파일은 구분 슬라이드가 의미 없는 코드만 포함
+  - 해결: 섹션명을 구분 슬라이드 다음 첫 번째 콘텐츠 슬라이드의 첫 줄에서 추출 (`_extract_section_name`)
+- CSV 문서 수: 21개로 잘못 기재 → 실제 20개 (PPTX 22개 파일 중 중복 2개)
+- 폴더명 `과거 제안서 자료(가상데이터)` → `mock_data` 반영
+- PDF(회사소개서) 추가: ACT 단위 5청크, 처음엔 페이지마다 분리됨 → ACT 번호별 병합으로 수정
+
+**소요 시간**: 약 45분  
+**다음 단계**: Phase 2 — Hybrid Retriever (메타데이터 필터 + 시맨틱 점수 결합)
+
 <!-- 이후 개발 과정은 아래에 추가 -->

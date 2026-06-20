@@ -155,7 +155,7 @@
 | 항목 | 내용 |
 |------|------|
 | 메타데이터 파일 | `docs/document-metadata.csv` (21개 문서, 11개 컬럼) |
-| 제안서 파일 | `docs/과거 제안서 자료(가상데이터)/` (PPTX 22개, 중복 포함 21개 고유 문서) |
+| 제안서 파일 | `docs/mock_data/` (PPTX 22개, 중복 포함 21개 고유 문서) |
 | 산업군 분류 | 자동차(S1, 5개), 가전(S2, 5개), 식음료(S3, 5개), 확장 레퍼런스/부동산(S4, 6개) |
 | 슬라이드 구조 | 33슬라이드 / 문서 (섹션 구분 슬라이드 + 콘텐츠 슬라이드 패턴) |
 
@@ -184,7 +184,7 @@ FIELD_MAP = {
 
 # 추가 파생 필드 (CSV에 없음 — 시스템이 생성)
 DERIVED_FIELDS = {
-    "file_path":    "str",  # "docs/과거 제안서 자료(가상데이터)/OP-S1-01_신차-런칭-...pptx"
+    "file_path":    "str",  # "docs/mock_data/OP-S1-01_신차-런칭-...pptx"
     "slide_texts":  "dict", # { section_name: [slide_text, ...] } — PPTX 파싱 결과
 }
 ```
