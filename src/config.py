@@ -28,8 +28,8 @@ FINAL_TOP_K = 3  # 최종 추천 수
 ALPHA = 0.4      # 메타데이터 가중치 (1-ALPHA = 시맨틱 가중치)
 
 # PPT text limits
-MAX_HEADLINE_LEN = 40
-MAX_BULLET_LEN = 60
+MAX_HEADLINE_LEN = 45
+MAX_BULLET_LEN = 75
 MAX_BULLETS = 5
 
 # Section divider detection
