@@ -17,6 +17,7 @@ from src.config import (
     ANTHROPIC_API_KEY, LLM_MODEL, ANALYZER_MODEL,
     TOP_K, FINAL_TOP_K, ALPHA,
 )
+from src.validator import validate_query
 from src.vector_store import search
 
 _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -76,20 +77,30 @@ _ANALYZER_USER = """[신규 제안 요청]
 }}"""
 
 
-def analyze_request(user_input: str) -> Dict[str, Any]:
-    """LLM call 1: free-text input → structured query dict. Uses Haiku for speed."""
-    msg = _client.messages.create(
-        model=ANALYZER_MODEL,
-        max_tokens=1024,
-        messages=[{
-            "role": "user",
-            "content": _ANALYZER_USER.format(user_input=user_input),
-        }],
-        system=_ANALYZER_SYSTEM,
-    )
-    raw = msg.content[0].text.strip()
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
-    return json.loads(raw)
+def analyze_request(user_input: str, max_retries: int = 2) -> Dict[str, Any]:
+    """LLM call 1: free-text input → structured query dict. Retries on parse/validation failure."""
+    last_err: Exception = RuntimeError("analyze_request: no attempts made")
+    for attempt in range(1, max_retries + 2):
+        try:
+            msg = _client.messages.create(
+                model=ANALYZER_MODEL,
+                max_tokens=1024,
+                messages=[{
+                    "role": "user",
+                    "content": _ANALYZER_USER.format(user_input=user_input),
+                }],
+                system=_ANALYZER_SYSTEM,
+            )
+            raw = msg.content[0].text.strip()
+            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
+            query = json.loads(raw)
+            validate_query(query)
+            return query
+        except (json.JSONDecodeError, ValueError) as e:
+            last_err = e
+            if attempt <= max_retries:
+                continue
+    raise RuntimeError(f"analyze_request failed after {max_retries + 1} attempts: {last_err}") from last_err
 
 
 # ── Hybrid Scoring ────────────────────────────────────────────────────────────

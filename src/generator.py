@@ -8,6 +8,7 @@ from typing import Dict, Any
 import anthropic
 
 from src.config import ANTHROPIC_API_KEY, LLM_MODEL, MAX_HEADLINE_LEN, MAX_BULLET_LEN, MAX_BULLETS
+from src.validator import validate_draft, enforce_limits
 
 _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -222,4 +223,92 @@ def generate_draft(retrieve_result: Dict[str, Any]) -> Dict[str, Any]:
         {"doc_id": r["doc_id"], "score": r["score"], "industry": r["metadata"]["industry"]}
         for r in results
     ]
+    return draft
+
+
+def build_prompts(retrieve_result: Dict[str, Any]) -> tuple:
+    """Extract system & user prompts for streaming generation.
+    Returns: (system_prompt, user_prompt)
+    """
+    query = retrieve_result["query"]
+    results = retrieve_result["results"]
+
+    references_text = _build_references_text(results)
+    section_list = "\n".join(f"{i+1}. {s}" for i, s in enumerate(DEFAULT_SECTIONS))
+
+    system_prompt = _SYSTEM.format(
+        max_headline=MAX_HEADLINE_LEN,
+        max_bullet=MAX_BULLET_LEN,
+        max_bullets=MAX_BULLETS,
+    )
+    user_prompt = _USER.format(
+        industry=query.get("industry", ""),
+        client_type=query.get("client_type", ""),
+        project_type=query.get("project_type", ""),
+        proposal_purpose=query.get("proposal_purpose", ""),
+        emphasized_values=", ".join(query.get("emphasized_values", [])),
+        tone_and_manner=query.get("tone_and_manner", ""),
+        key_needs_keywords=", ".join(query.get("key_needs_keywords", [])),
+        references_text=references_text,
+        n_refs=len(results),
+        section_list=section_list,
+        max_headline=MAX_HEADLINE_LEN,
+        max_bullet=MAX_BULLET_LEN,
+        max_bullets=MAX_BULLETS,
+    )
+    return system_prompt, user_prompt
+
+
+def regenerate_section(draft: Dict[str, Any], section_idx: int,
+                      instruction: str, retrieve_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Regenerate a single section with custom instruction.
+    
+    Args:
+        draft: current draft
+        section_idx: section index (0-based)
+        instruction: user instruction for regeneration
+        retrieve_result: original retrieval result
+    
+    Returns:
+        updated draft
+    """
+    query = retrieve_result["query"]
+    results = retrieve_result["results"]
+    references_text = _build_references_text(results)
+    section_list = "\n".join(f"{i+1}. {s}" for i, s in enumerate(DEFAULT_SECTIONS))
+
+    system_prompt = _SYSTEM.format(
+        max_headline=MAX_HEADLINE_LEN,
+        max_bullet=MAX_BULLET_LEN,
+        max_bullets=MAX_BULLETS,
+    )
+    
+    regen_prompt = f"""위 제안서 초안의 섹션 {section_idx + 1}을 다시 작성하세요.
+
+[재작성 요청]
+{instruction}
+
+[현재 섹션]
+{json.dumps(draft['sections'][section_idx], ensure_ascii=False, indent=2)}
+
+[출력 형식]
+JSON 단일 객체: {{"section_name": "...", "headline": "...", "subtitle": "...", "bullets": [...], "notes": "..."}}
+"""
+
+    msg = _client.messages.create(
+        model=LLM_MODEL,
+        max_tokens=2000,
+        system=system_prompt,
+        messages=[{"role": "user", "content": regen_prompt}],
+    )
+
+    raw = msg.content[0].text.strip()
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
+    try:
+        updated_sec = json.loads(raw)
+        enforce_limits(updated_sec)
+        draft["sections"][section_idx] = updated_sec
+    except (json.JSONDecodeError, ValueError) as e:
+        raise RuntimeError(f"Failed to regenerate section {section_idx}: {e}") from e
+
     return draft
