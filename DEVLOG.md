@@ -132,4 +132,76 @@
 **소요 시간**: 약 20분  
 **처리 시간 측정**: ~70초 (목표 ≤3분 충족)
 
+---
+
+## [2026-06-20] 고도화 1단계 — 검색 품질 개선
+
+**단계**: 고도화 Phase 1 — retriever.py 개선 + evaluator.py 신규  
+**결과**: 성공
+
+**발견한 문제**:
+- `_metadata_score()` 키워드 매칭이 정확 문자열 비교 → "팝업 스토어" ≠ "F&B 팝업" → OP-S3-02 keyword_score = 0
+- 섹션 집계 max pooling → OP-S4-02(확장 레퍼런스)의 XR 섹션 하나가 자동차·가전 시나리오 top-3에 침투
+- 톤앤매너가 메타데이터 스코어에 미반영
+
+**적용한 수정**:
+1. `_soft_keyword_match()` 추가 — 토큰 split 기반 부분 매칭
+2. 가중치 조정: project_type 0.30→0.25, key_needs 0.20→0.15, tone 0.10 신규 추가
+3. 섹션 집계: max → top-2 평균
+
+**검증**:
+- `src/evaluator.py` 신규 작성 — LLM 호출 없이 3개 사전 정의 테스트 케이스로 P@3/MRR/H-P@3 계산
+- Alpha sweep(0.2~0.7): 모든 alpha에서 P@3=1.0, MRR=1.0 → alpha-insensitive 확인 → 0.4 유지
+
+**개선 결과**:
+| 시나리오 | 개선 전 | 개선 후 |
+|---------|---------|---------|
+| 자동차 XR | S1-03, S1-01, **S4-02** | S1-03, S1-01, **S1-02** ✓ |
+| 가전 hybrid | S2-03, S2-01, **S4-02** | S2-01, S2-03, **S2-05** ✓ |
+| 식음료 popup | S3-01, S3-02, S3-03 | S3-01, S3-02, S3-03 ✓ (유지) |
+
+**소요 시간**: 약 30분  
+**다음 단계**: 고도화 2단계 — 안정성 (LLM 출력 검증 + 에러 핸들링)
+
+---
+
+## [2026-06-20] 고도화 2단계 — 안정성 강화
+
+**단계**: 고도화 Phase 2 — validator.py 신규 + retriever/generator/run/app 에러 핸들링 추가  
+**결과**: 성공
+
+**추가된 보호 장치**:
+
+| 위치 | 처리 |
+|------|------|
+| `src/validator.py` | `validate_query()`: 필수 필드 누락 감지 / `validate_draft()`: 구조 이상 감지 / `enforce_limits()`: 자·줄 수 강제 절사 |
+| `src/retriever.py` `analyze_request()` | 파싱 실패·검증 실패 시 최대 2회 재시도, 3회 모두 실패 시 명확한 RuntimeError |
+| `src/generator.py` `generate_draft()` | 메인 초안 최대 3회 재시도. 슬라이드2는 best-effort (실패 시 빈 배열, 크래시 없음) |
+| `run.py` | 3단계 각각 try/except, 실패 시 오류 메시지 출력 후 sys.exit(1) |
+| `app.py` | 3단계 각각 try/except, 실패 시 st.error() + st.stop() |
+
+**검증**:
+- `validate_query({industry: 자동차})` → `ValueError: query missing required fields: [...]` ✓
+- `enforce_limits()`: headline 80자 → 45자, bullets 7개 → 5개 절사 ✓
+
+**소요 시간**: 약 20분  
+**다음 단계**: 고도화 3단계 — UX (스트리밍 출력, 섹션 재생성)
+
+---
+
+## [2026-06-20] 고도화 3단계 — UX: 스트리밍 출력
+
+**단계**: 고도화 Phase 3 — app.py 스트리밍  
+**결과**: 성공
+
+**변경 내용**:
+- `generate_draft()` 호출을 `build_prompts()` + Anthropic `messages.stream()` 컨텍스트로 교체
+- 스트림 중 `section_name` 필드를 정규식으로 실시간 파싱 → `st.empty()` 박스에 "섹션 N/8 — 마지막 섹션: ..." 진행 표시
+- slide-2 보조 콘텐츠는 스트리밍 완료 후 별도 non-streaming 호출 (best-effort)
+- JSON 파싱·검증·limit 강제는 스트리밍 완료 후 기존 validator 재사용
+
+**효과**: 70초 완전 블로킹 → 토큰 도착 즉시 화면 업데이트. 사용자가 생성 진행 상황을 실시간 확인 가능
+
+**소요 시간**: 약 20분
+
 <!-- 이후 개발 과정은 아래에 추가 -->

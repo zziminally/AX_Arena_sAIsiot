@@ -8,6 +8,7 @@ from typing import Dict, Any
 import anthropic
 
 from src.config import ANTHROPIC_API_KEY, LLM_MODEL, MAX_HEADLINE_LEN, MAX_BULLET_LEN, MAX_BULLETS
+from src.validator import validate_draft, enforce_limits
 
 _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -116,25 +117,12 @@ def _build_references_text(results: list, max_chars_per_section: int = 800) -> s
     return "\n\n".join(parts)
 
 
-def generate_draft(retrieve_result: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Claude call → full proposal draft.
-
-    Returns:
-    {
-        "cover": {"title", "subtitle"},
-        "sections": [{"section_name", "headline", "subtitle", "bullets", "notes"}, ...],
-        "sections_slide2": [...],   # second slide content per section
-        "query": ...,
-        "references": ...
-    }
-    """
+def build_prompts(retrieve_result: Dict[str, Any]):
+    """Return (system_prompt, user_prompt) without making an API call. Used by streaming path."""
     query = retrieve_result["query"]
     results = retrieve_result["results"]
-
     references_text = _build_references_text(results)
     section_list = "\n".join(f"{i+1}. {s}" for i, s in enumerate(DEFAULT_SECTIONS))
-
     system_prompt = _SYSTEM.format(
         max_headline=MAX_HEADLINE_LEN,
         max_bullet=MAX_BULLET_LEN,
@@ -155,43 +143,127 @@ def generate_draft(retrieve_result: Dict[str, Any]) -> Dict[str, Any]:
         max_bullet=MAX_BULLET_LEN,
         max_bullets=MAX_BULLETS,
     )
+    return system_prompt, user_prompt
 
-    # First call: main draft
-    msg = _client.messages.create(
-        model=LLM_MODEL,
-        max_tokens=16000,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
 
-    raw = msg.content[0].text.strip()
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
-    draft = json.loads(raw)
+def generate_draft(retrieve_result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Claude call → full proposal draft.
 
-    # Second call: slide-2 content for each section
-    slide2_msg = _client.messages.create(
-        model=LLM_MODEL,
-        max_tokens=8000,
-        system=system_prompt,
-        messages=[
-            {"role": "user", "content": user_prompt},
-            {"role": "assistant", "content": raw},
-            {"role": "user", "content": _USER_SLIDE2},
-        ],
-    )
+    Returns:
+    {
+        "cover": {"title", "subtitle"},
+        "sections": [{"section_name", "headline", "subtitle", "bullets", "notes"}, ...],
+        "sections_slide2": [...],   # second slide content per section
+        "query": ...,
+        "references": ...
+    }
+    """
+    query = retrieve_result["query"]
+    results = retrieve_result["results"]
 
-    raw2 = slide2_msg.content[0].text.strip()
-    raw2 = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw2, flags=re.DOTALL).strip()
+    system_prompt, user_prompt = build_prompts(retrieve_result)
+
+    # ── Call 1: main draft (with retry) ─────────────────────────────────────
+    last_err: Exception = RuntimeError("generate_draft: no attempts made")
+    raw = ""
+    draft: Dict[str, Any] = {}
+    for attempt in range(1, 4):  # up to 3 attempts
+        try:
+            msg = _client.messages.create(
+                model=LLM_MODEL,
+                max_tokens=16000,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            raw = msg.content[0].text.strip()
+            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
+            draft = json.loads(raw)
+            validate_draft(draft)
+            break
+        except (json.JSONDecodeError, ValueError) as e:
+            last_err = e
+            if attempt == 3:
+                raise RuntimeError(f"generate_draft failed after 3 attempts: {last_err}") from last_err
+
+    # ── Call 2: slide-2 content (best-effort, non-critical) ──────────────────
     try:
+        slide2_msg = _client.messages.create(
+            model=LLM_MODEL,
+            max_tokens=8000,
+            system=system_prompt,
+            messages=[
+                {"role": "user", "content": user_prompt},
+                {"role": "assistant", "content": raw},
+                {"role": "user", "content": _USER_SLIDE2},
+            ],
+        )
+        raw2 = slide2_msg.content[0].text.strip()
+        raw2 = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw2, flags=re.DOTALL).strip()
         draft2 = json.loads(raw2)
         draft["sections_slide2"] = draft2.get("sections_slide2", [])
-    except json.JSONDecodeError:
+    except Exception:
         draft["sections_slide2"] = []
 
-    # Attach metadata
+    # ── Enforce text limits, attach metadata ─────────────────────────────────
+    enforce_limits(draft)
     draft["query"] = query
     draft["references"] = [
         {"doc_id": r["doc_id"], "score": r["score"], "industry": r["metadata"]["industry"]}
         for r in results
     ]
     return draft
+
+
+def regenerate_section(
+    section_name: str,
+    instruction: str,
+    current_section: Dict[str, Any],
+    retrieve_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Re-generate a single section based on user instruction.
+    Returns an updated section dict.
+    """
+    system_prompt, _ = build_prompts(retrieve_result)
+
+    bullets_text = "\n".join(f"- {b}" for b in current_section.get("bullets", []))
+    user_msg = f"""제안서의 [{section_name}] 섹션을 아래 지시사항에 따라 수정하십시오.
+
+[수정 지시사항]
+{instruction}
+
+[현재 섹션 내용 (참고)]
+headline: {current_section.get('headline', '')}
+subtitle: {current_section.get('subtitle', '')}
+bullets:
+{bullets_text}
+
+[출력 형식 — JSON only, 마크다운·설명 텍스트 없이]
+{{
+  "section_name": "{section_name}",
+  "headline": "수정된 헤드라인 ({MAX_HEADLINE_LEN}자 이내)",
+  "subtitle": "수정된 서브타이틀",
+  "bullets": ["수정된 내용 1", "수정된 내용 2", "수정된 내용 3", "수정된 내용 4", "수정된 내용 5"],
+  "notes": "발표자 노트"
+}}"""
+
+    last_err: Exception = RuntimeError("no attempts")
+    for attempt in range(1, 3):
+        try:
+            msg = _client.messages.create(
+                model=LLM_MODEL,
+                max_tokens=1024,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_msg}],
+            )
+            raw = msg.content[0].text.strip()
+            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
+            sec = json.loads(raw)
+            if not sec.get("headline") or not isinstance(sec.get("bullets"), list):
+                raise ValueError("Missing required fields")
+            sec["section_name"] = section_name  # preserve original name
+            return sec
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"섹션 재생성 실패: {last_err}") from last_err

@@ -18,7 +18,11 @@ def main(user_input: str) -> None:
 
     # ── Step 1: Retrieve ───────────────────────────────────────────────────
     print("[1/3] 레퍼런스 검색 중...")
-    result = retrieve(user_input)
+    try:
+        result = retrieve(user_input)
+    except Exception as e:
+        print(f"  [오류] 레퍼런스 검색 실패: {e}")
+        sys.exit(1)
     q = result["query"]
     print(f"  분석 → 산업군: {q['industry']} | 유형: {q['project_type']}")
     print(f"  추천 레퍼런스:")
@@ -28,7 +32,11 @@ def main(user_input: str) -> None:
 
     # ── Step 2: Generate draft ─────────────────────────────────────────────
     print("\n[2/3] 제안서 초안 생성 중...")
-    draft = generate_draft(result)
+    try:
+        draft = generate_draft(result)
+    except Exception as e:
+        print(f"  [오류] 초안 생성 실패: {e}")
+        sys.exit(1)
     print(f"  표지: {draft['cover']['title']}")
     print(f"  섹션 수: {len(draft.get('sections', []))}")
     for s in draft.get("sections", []):
@@ -38,8 +46,12 @@ def main(user_input: str) -> None:
 
     # ── Step 3: Assemble PPT ───────────────────────────────────────────────
     print("\n[3/3] PPT 조립 중...")
-    template_path = str(Path(result["results"][0]["metadata"]["file_path"]))
-    output_path = assemble(draft, template_path)
+    try:
+        template_path = str(Path(result["results"][0]["metadata"]["file_path"]))
+        output_path = assemble(draft, template_path)
+    except Exception as e:
+        print(f"  [오류] PPT 조립 실패: {e}")
+        sys.exit(1)
     print(f"  저장: {output_path}")
 
     # ── Save full retrieval log ────────────────────────────────────────────

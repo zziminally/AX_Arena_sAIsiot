@@ -25,7 +25,7 @@ LLM_MODEL = "claude-sonnet-4-6"
 CHROMA_COLLECTION = "proposals"
 TOP_K = 5        # 벡터 검색 후보
 FINAL_TOP_K = 3  # 최종 추천 수
-ALPHA = 0.4      # 메타데이터 가중치 (1-ALPHA = 시맨틱 가중치)
+ALPHA = 0.4      # 메타데이터 가중치 (1-ALPHA = 시맨틱 가중치); eval sweep에서 alpha-insensitive 확인 → 0.4 유지
 
 # PPT text limits
 MAX_HEADLINE_LEN = 45
