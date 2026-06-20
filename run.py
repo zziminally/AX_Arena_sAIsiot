@@ -31,6 +31,10 @@ def main(user_input: str) -> None:
     draft = generate_draft(result)
     print(f"  표지: {draft['cover']['title']}")
     print(f"  섹션 수: {len(draft.get('sections', []))}")
+    for s in draft.get("sections", []):
+        bullets_count = len(s.get("bullets", []))
+        print(f"    [{s['section_name']}] headline={bool(s.get('headline'))} "
+              f"subtitle={bool(s.get('subtitle'))} bullets={bullets_count}")
 
     # ── Step 3: Assemble PPT ───────────────────────────────────────────────
     print("\n[3/3] PPT 조립 중...")
@@ -38,17 +42,15 @@ def main(user_input: str) -> None:
     output_path = assemble(draft, template_path)
     print(f"  저장: {output_path}")
 
-    # ── Save retrieval log ─────────────────────────────────────────────────
+    # ── Save full retrieval log ────────────────────────────────────────────
     log_path = output_path.with_suffix(".json")
     log = {
-        "user_input":  user_input,
-        "query":       draft["query"],
-        "references":  draft["references"],
-        "cover":       draft["cover"],
-        "sections":    [
-            {"section_name": s["section_name"], "headline": s["headline"]}
-            for s in draft.get("sections", [])
-        ],
+        "user_input":     user_input,
+        "query":          draft["query"],
+        "references":     draft["references"],
+        "cover":          draft["cover"],
+        "sections":       draft.get("sections", []),
+        "sections_slide2": draft.get("sections_slide2", []),
     }
     log_path.write_text(json.dumps(log, ensure_ascii=False, indent=2))
     print(f"  로그:  {log_path}")
