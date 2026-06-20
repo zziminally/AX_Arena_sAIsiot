@@ -20,6 +20,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 # Model settings
 EMBEDDING_MODEL = "text-embedding-3-small"
 LLM_MODEL = "claude-sonnet-4-6"
+ANALYZER_MODEL = "claude-haiku-4-5-20251001"
 
 # Retrieval settings
 CHROMA_COLLECTION = "proposals"

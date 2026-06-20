@@ -17,37 +17,52 @@ from src.ingestor import _slide_text, _is_divider, _extract_section_name
 
 NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 PAGE_NUM_RE = re.compile(r"^\d{1,3}$")
+_ACT_RE     = re.compile(r"^ACT\s*(\d+)$", re.IGNORECASE)
+
+# 브랜딩 텍스트 감지 (contains 방식 — full string match 불필요)
+_BRANDING_CONTAIN = re.compile(r"OLIMPLANET|©\s*OLIMPLANET", re.IGNORECASE)
+
+# 슬라이드 상단 1400pt 이하 = 헤드라인/섹션 레이블 영역
+HEADLINE_ZONE_MAX_EMU = 1_400_000
+
+# 카드 레이아웃 컬럼 그룹핑 허용 폭 (300pt)
+CARD_COL_TOLERANCE_PT = 300
+
+# 마침표·쉼표 앞 공백 제거
+_PUNCT_RE = re.compile(r"\s+([.。,，!?！？])")
+
+
+def _clean(text: str) -> str:
+    return _PUNCT_RE.sub(r"\1", text).strip()
+
+
+# ── Overflow 방지 ─────────────────────────────────────────────────────────────
+
+def _enable_autofit(tf) -> None:
+    txBody = tf._txBody
+    bodyPr = txBody.find(qn("a:bodyPr"))
+    if bodyPr is None:
+        return
+    for tag in [qn("a:normAutofit"), qn("a:spAutoFit"), qn("a:noAutofit")]:
+        elem = bodyPr.find(tag)
+        if elem is not None:
+            bodyPr.remove(elem)
+    etree.SubElement(bodyPr, qn("a:normAutofit"))
 
 
 # ── Format-preserving text replacement ───────────────────────────────────────
 
-def _first_run(para_elem) -> Optional[Any]:
-    """Return first <a:r> element in a paragraph, or None."""
-    runs = para_elem.findall(f"{{{NS}}}r")
-    return runs[0] if runs else None
-
-
 def _set_para_text(para_elem, text: str) -> None:
-    """
-    Replace text in a single paragraph element while preserving ALL run formatting.
-    Keeps <a:pPr> (paragraph props: spacing, indent, bullet, alignment) intact.
-    Keeps <a:rPr> (run props: color, font, size, bold) from the first run.
-    """
+    text = _clean(text)
     runs = para_elem.findall(f"{{{NS}}}r")
     brs  = para_elem.findall(f"{{{NS}}}br")
-
-    # Remove existing runs and line-break elements
     for elem in runs + brs:
         para_elem.remove(elem)
-
     if not runs:
-        # No template run — create a bare run
         r = etree.SubElement(para_elem, qn("a:r"))
         t = etree.SubElement(r, qn("a:t"))
         t.text = text
         return
-
-    # Clone first run (preserves <a:rPr> with color, font, size…)
     template_r = deepcopy(runs[0])
     t_elem = template_r.find(f"{{{NS}}}t")
     if t_elem is None:
@@ -57,90 +72,56 @@ def _set_para_text(para_elem, text: str) -> None:
 
 
 def _set_tf_single(tf, text: str) -> None:
-    """
-    Replace text frame with a single line of text.
-    Preserves paragraph and run formatting of the original first paragraph.
-    """
     txBody = tf._txBody
     paras = txBody.findall(f"{{{NS}}}p")
     if not paras:
         return
-
-    # Keep only the first paragraph
     for p in paras[1:]:
         txBody.remove(p)
-
     _set_para_text(paras[0], text)
+    _enable_autofit(tf)
 
 
 def _set_tf_lines(tf, lines: List[str]) -> None:
-    """
-    Replace text frame with multiple lines (one paragraph per line).
-    Each new paragraph is a deep-clone of the first original paragraph,
-    so all formatting (bullet style, indent, font color, size) is preserved.
-    """
     if not lines:
         return
-
     txBody = tf._txBody
     paras = txBody.findall(f"{{{NS}}}p")
     if not paras:
         return
-
-    # Find best template paragraph: first one that has a run
-    template_p = None
-    for p in paras:
-        if p.findall(f"{{{NS}}}r"):
-            template_p = p
-            break
-    if template_p is None:
-        template_p = paras[0]
-
-    # Remove ALL existing paragraphs
+    template_p = next((p for p in paras if p.findall(f"{{{NS}}}r")), paras[0])
     for p in paras:
         txBody.remove(p)
-
-    # Create one paragraph per line, cloned from template
     for line in lines:
         new_p = deepcopy(template_p)
         _set_para_text(new_p, line)
         txBody.append(new_p)
+    _enable_autofit(tf)
 
 
 def _set_tf_with_breaks_v2(tf, text: str) -> None:
-    """
-    Better version: preserve run format AND support \\n soft line breaks.
-    """
-    parts = [p.strip() for p in re.split(r"\\n|\n", text) if p.strip()]
+    """\\n → soft line break within one paragraph, preserving run format."""
+    parts = [_clean(p) for p in re.split(r"\\n|\n", text) if p.strip()]
     if not parts:
         return
-
     txBody = tf._txBody
     paras = txBody.findall(f"{{{NS}}}p")
     if not paras:
         return
-
     para = paras[0]
     for p in paras[1:]:
         txBody.remove(p)
-
-    # Capture template run BEFORE removing
     runs = para.findall(f"{{{NS}}}r")
     template_r = deepcopy(runs[0]) if runs else None
-
-    # Remove existing content from paragraph
     for elem in para.findall(f"{{{NS}}}r") + para.findall(f"{{{NS}}}br"):
         para.remove(elem)
-
     for i, part in enumerate(parts):
         if i > 0:
             br = etree.SubElement(para, qn("a:br"))
-            # Copy rPr to break element so color/font is consistent
             if template_r is not None:
                 rpr = template_r.find(f"{{{NS}}}rPr")
                 if rpr is not None:
                     br.insert(0, deepcopy(rpr))
-
         if template_r is not None:
             new_r = deepcopy(template_r)
             t_elem = new_r.find(f"{{{NS}}}t")
@@ -152,15 +133,40 @@ def _set_tf_with_breaks_v2(tf, text: str) -> None:
             r = etree.SubElement(para, qn("a:r"))
             t = etree.SubElement(r, qn("a:t"))
             t.text = part
+    _enable_autofit(tf)
+
+
+# ── Branding cleanup ──────────────────────────────────────────────────────────
+
+def _clear_text_shape(shape) -> None:
+    """Run 텍스트를 모두 빈 문자열로 초기화."""
+    for para in shape.text_frame.paragraphs:
+        for run in para.runs:
+            run.text = ""
+
+
+def _clear_slide_branding(slide, slide_height: int) -> None:
+    """
+    모든 슬라이드에서 OLIMPLANET 워터마크, © 푸터, 하단 페이지 번호를 제거.
+    섹션 레이블(빨간 텍스트)·카드 번호 등은 건드리지 않음.
+    """
+    bottom_threshold = int(slide_height * 0.85)
+    for shape in slide.shapes:
+        if not shape.has_text_frame:
+            continue
+        t = shape.text_frame.text.strip()
+        if not t:
+            continue
+        if _BRANDING_CONTAIN.search(t):
+            _clear_text_shape(shape)
+        elif PAGE_NUM_RE.match(t) and shape.top > bottom_threshold:
+            # 하단 페이지 번호만 제거 (카드 내부 번호는 top이 낮으므로 제외)
+            _clear_text_shape(shape)
 
 
 # ── Shape classification ──────────────────────────────────────────────────────
 
 def _text_shapes_by_area(slide) -> List[Tuple[int, Any]]:
-    """
-    Return (area_emu, shape) for non-boilerplate text shapes, sorted by area DESC.
-    Area = width × height in EMU units.
-    """
     result = []
     for shape in slide.shapes:
         if not shape.has_text_frame:
@@ -168,46 +174,73 @@ def _text_shapes_by_area(slide) -> List[Tuple[int, Any]]:
         t = shape.text_frame.text.strip()
         if not t or t in BOILERPLATE or PAGE_NUM_RE.match(t):
             continue
-        area = shape.width * shape.height
-        result.append((area, shape))
+        result.append((shape.width * shape.height, shape))
     return sorted(result, key=lambda x: -x[0])
 
 
 # ── Cover slide ───────────────────────────────────────────────────────────────
 
-def _replace_cover(slide, cover: Dict) -> None:
+def _replace_cover(slide, cover: Dict, slide_height: int) -> None:
     """
-    Replace cover title and subtitle.
-    Strategy: shapes sorted by area — largest = main title, 2nd = subtitle.
-    Uses _set_tf_with_breaks_v2 to support \\n in subtitle.
+    커버 슬라이드: 브랜딩 제거 → title/subtitle 교체.
+    _clear_slide_branding으로 PROPOSAL, OLIMPLANET, © 전부 제거.
     """
+    _clear_slide_branding(slide, slide_height)
+
+    # PROPOSAL 같은 별도 텍스트 shape도 직접 지움
+    for shape in slide.shapes:
+        if not shape.has_text_frame:
+            continue
+        t = shape.text_frame.text.strip()
+        if t.upper() == "PROPOSAL":
+            _clear_text_shape(shape)
+
     shapes = _text_shapes_by_area(slide)
     if not shapes:
         return
-
     title    = cover.get("title", "")
     subtitle = cover.get("subtitle", "")
-
     if len(shapes) >= 2:
         _set_tf_single(shapes[0][1].text_frame, title)
         _set_tf_with_breaks_v2(shapes[1][1].text_frame, subtitle)
     elif shapes:
         _set_tf_single(shapes[0][1].text_frame, title)
+    for _, shape in shapes[2:]:
+        _set_tf_single(shape.text_frame, "")
+
+
+# ── Section divider slide ─────────────────────────────────────────────────────
+
+def _replace_divider_slide(slide, act_tagline: str) -> None:
+    """
+    섹션 구분 슬라이드:
+    - 가장 큰 shape → act_tagline
+    - 'ACT NN' shape → 'NN' (ACT 접두어 제거)
+    """
+    shapes = _text_shapes_by_area(slide)
+    if not shapes:
+        return
+    _set_tf_single(shapes[0][1].text_frame, act_tagline)
+    for _, shape in shapes[1:]:
+        t = shape.text_frame.text.strip()
+        m = _ACT_RE.match(t)
+        if m:
+            _set_tf_single(shape.text_frame, m.group(1))
+            break
 
 
 # ── Content slide ─────────────────────────────────────────────────────────────
 
-def _replace_content_slide(slide, sec_draft: Dict) -> None:
+def _replace_content_slide(slide, sec_draft: Dict, slide_height: int = 6858000) -> None:
     """
-    Replace a content slide's text with generated draft content.
+    Y좌표 기반 shape 분류:
 
-    Shape role assignment by area (EMU):
-      - Largest shape  → body (subtitle line + bullet points)
-      - 2nd largest    → headline
-      - Smaller shapes → section header labels (do NOT modify)
-
-    This is more reliable than the previous text-length heuristic because
-    shape dimensions are fixed by the template design and don't change with content.
+    hl_zone   (top < HEADLINE_ZONE_MAX_EMU):  가장 큰 shape → headline
+    body_zone (top ≥ HEADLINE_ZONE_MAX_EMU):
+      - 1개     → 표준 body (subtitle + bullets)
+      - 복수 / 카드 레이아웃:
+          300pt 컬럼 허용폭으로 묶어 title+description 쌍 감지
+          → "항목명: 설명" 분리해 title shape=항목명, desc shape=설명
     """
     shapes = _text_shapes_by_area(slide)
     if not shapes:
@@ -217,44 +250,78 @@ def _replace_content_slide(slide, sec_draft: Dict) -> None:
     subtitle = sec_draft.get("subtitle", "")
     bullets  = sec_draft.get("bullets", [])
 
-    # Build body lines: subtitle first (if present), then each bullet as its own line
     body_lines: List[str] = []
     if subtitle:
-        # Subtitle may contain \n markers — expand into separate body lines
-        sub_parts = [p.strip() for p in re.split(r"\\n|\n", subtitle) if p.strip()]
-        body_lines.extend(sub_parts)
+        body_lines.extend([p.strip() for p in re.split(r"\\n|\n", subtitle) if p.strip()])
     body_lines.extend(bullets)
 
-    if len(shapes) >= 3:
-        # 3+ shapes: largest=body, 2nd=headline, rest=section headers (skip)
-        _set_tf_lines(shapes[0][1].text_frame, body_lines)
-        _set_tf_single(shapes[1][1].text_frame, headline)
-    elif len(shapes) == 2:
-        # 2 shapes: larger=body, smaller=headline
-        _set_tf_lines(shapes[0][1].text_frame, body_lines)
-        _set_tf_single(shapes[1][1].text_frame, headline)
-    else:
-        # 1 shape: put everything in it
+    # 단일 shape → 전부 삽입
+    if len(shapes) == 1:
         all_lines = ([headline] if headline else []) + body_lines
         _set_tf_lines(shapes[0][1].text_frame, all_lines)
+        return
+
+    hl_zone   = sorted([(a, s) for a, s in shapes if s.top <  HEADLINE_ZONE_MAX_EMU], key=lambda x: -x[0])
+    body_zone = sorted([(a, s) for a, s in shapes if s.top >= HEADLINE_ZONE_MAX_EMU], key=lambda x: -x[0])
+
+    # 헤드라인
+    headline_shape = hl_zone[0][1] if hl_zone else shapes[0][1]
+    _set_tf_single(headline_shape.text_frame, headline)
+
+    if not body_zone:
+        return
+
+    if len(body_zone) == 1:
+        _set_tf_lines(body_zone[0][1].text_frame, body_lines)
+        return
+
+    # 복수 body shapes → 카드 레이아웃 처리
+    # round/floor 기반 그리드 대신 인접 거리 클러스터링 사용:
+    # 같은 카드 내 title·description shape의 left 차이 ≈ 60pt,
+    # 카드 간 gap ≈ 2500pt → 150pt 임계값으로 정확히 구분
+    GAP_EMU = CARD_COL_TOLERANCE_PT * 914
+
+    sorted_shapes = sorted(body_zone, key=lambda x: x[1].left)
+    col_groups: List[List[Tuple[int, Any]]] = []
+    cur: List[Tuple[int, Any]] = [sorted_shapes[0]]
+    for item in sorted_shapes[1:]:
+        if item[1].left - cur[-1][1].left <= GAP_EMU:
+            cur.append(item)
+        else:
+            col_groups.append(cur)
+            cur = [item]
+    col_groups.append(cur)
+
+    for i, col_shapes in enumerate(col_groups):
+        if i >= len(bullets):
+            break
+        bullet = bullets[i]
+
+        # "항목명: 설명" 분리
+        if ": " in bullet:
+            card_title, card_body = bullet.split(": ", 1)
+        else:
+            card_title, card_body = bullet, bullet
+
+        # 컬럼 내 면적 오름차순: 작은 shape=제목, 큰 shape=설명
+        col_sorted = sorted(col_shapes, key=lambda x: x[0])
+        if len(col_sorted) >= 2:
+            _set_tf_single(col_sorted[0][1].text_frame, card_title)
+            _set_tf_single(col_sorted[-1][1].text_frame, card_body)
+        else:
+            _set_tf_single(col_sorted[0][1].text_frame, bullet)
 
 
 # ── Section-to-slide mapping ──────────────────────────────────────────────────
 
 def _normalize(name: str) -> str:
-    """Normalize a section name for fuzzy matching."""
-    return re.sub(r"[\s/·\-·또는|]", "", name).lower()
+    return re.sub(r"[\s/·\-또는|]", "", name).lower()
 
 
-def _map_sections_to_slides(prs: Presentation) -> Dict[str, List[int]]:
-    """
-    Parse PPTX and return {section_name: [content_slide_indices]}.
-    Skips slide 0 (cover) and slide 1 (TOC).
-    """
+def _map_sections_to_slides(prs: Presentation) -> Dict[str, Dict]:
     texts = [_slide_text(s) for s in prs.slides]
-    section_map: Dict[str, List[int]] = {}
+    section_map: Dict[str, Dict] = {}
     current_section: Optional[str] = None
-
     for i, text in enumerate(texts):
         if i < 2:
             continue
@@ -263,88 +330,67 @@ def _map_sections_to_slides(prs: Presentation) -> Dict[str, List[int]]:
         if _is_divider(text):
             next_text = texts[i + 1] if i + 1 < len(texts) else ""
             current_section = _extract_section_name(text, next_text)
-            section_map[current_section] = []
+            section_map[current_section] = {"divider": i, "content": []}
         elif current_section is not None:
-            section_map[current_section].append(i)
-
+            section_map[current_section]["content"].append(i)
     return section_map
 
 
-def _find_slide_indices(sec_name: str, section_map: Dict[str, List[int]]) -> List[int]:
-    """
-    Find slide indices for a section name with fuzzy matching.
-    Priority: exact → normalized-exact → partial-overlap.
-    """
-    # 1. Exact match
+def _find_section_info(sec_name: str, section_map: Dict[str, Dict]) -> Dict:
+    _empty = {"divider": None, "content": []}
     if sec_name in section_map:
         return section_map[sec_name]
-
     norm_query = _normalize(sec_name)
-
-    # 2. Normalized exact match
-    for mapped, indices in section_map.items():
+    for mapped, info in section_map.items():
         if _normalize(mapped) == norm_query:
-            return indices
-
-    # 3. Best partial overlap (longest common substring of normalized names)
-    best_indices: List[int] = []
-    best_overlap = 0
-    for mapped, indices in section_map.items():
+            return info
+    best_info, best_overlap = _empty, 0
+    for mapped, info in section_map.items():
         norm_mapped = _normalize(mapped)
-        # Count overlapping chars using set of substrings of length 3+
-        overlap = sum(1 for k in range(len(norm_query) - 2)
-                      if norm_query[k:k+3] in norm_mapped)
+        overlap = sum(1 for k in range(len(norm_query) - 2) if norm_query[k:k+3] in norm_mapped)
         if overlap > best_overlap:
-            best_overlap = overlap
-            best_indices = indices
-
-    return best_indices if best_overlap >= 1 else []
+            best_overlap, best_info = overlap, info
+    return best_info if best_overlap >= 1 else _empty
 
 
 # ── Main assembly ─────────────────────────────────────────────────────────────
 
 def assemble(draft: Dict[str, Any], template_pptx_path: str) -> Path:
-    """
-    Copy template PPTX and replace text with generated draft.
-    - Slide 0: cover
-    - Per section: first content slide ← slide-1 draft
-                   second content slide ← slide-2 draft (if available)
-    Returns output file path.
-    """
     OUTPUT_DIR.mkdir(exist_ok=True)
-
     title_slug = re.sub(r"[^\w가-힣]", "_", draft["cover"].get("title", "proposal"))[:40]
     output_path = OUTPUT_DIR / f"draft_{title_slug}.pptx"
 
     shutil.copy(template_pptx_path, output_path)
     prs = Presentation(str(output_path))
+    slide_h = prs.slide_height
 
-    # 1. Cover
-    _replace_cover(prs.slides[0], draft["cover"])
+    # 1. Cover (브랜딩 제거는 커버에만 적용)
+    _replace_cover(prs.slides[0], draft["cover"], slide_h)
 
-    # 2. Build section → slide index map
+    # 3. Section map
     section_map = _map_sections_to_slides(prs)
+    slide2_lookup: Dict[str, Dict] = {
+        s.get("section_name", ""): s for s in draft.get("sections_slide2", [])
+    }
 
-    # 3. Build slide-2 lookup: section_name → sec_draft
-    slide2_lookup: Dict[str, Dict] = {}
-    for s in draft.get("sections_slide2", []):
-        slide2_lookup[s.get("section_name", "")] = s
-
-    # 4. Replace content slides section by section
+    # 4. Replace per section
     for sec_draft in draft.get("sections", []):
         sec_name = sec_draft.get("section_name", "")
-        slide_indices = _find_slide_indices(sec_name, section_map)
-        if not slide_indices:
+        info = _find_section_info(sec_name, section_map)
+
+        if info["divider"] is not None and sec_draft.get("act_tagline"):
+            _replace_divider_slide(prs.slides[info["divider"]], sec_draft["act_tagline"])
+
+        content = info["content"]
+        if not content:
             continue
 
-        # First content slide ← primary draft
-        _replace_content_slide(prs.slides[slide_indices[0]], sec_draft)
+        _replace_content_slide(prs.slides[content[0]], sec_draft, slide_h)
 
-        # Second content slide ← slide-2 draft (if available and exists)
-        if len(slide_indices) >= 2:
+        if len(content) >= 2:
             s2 = slide2_lookup.get(sec_name)
             if s2:
-                _replace_content_slide(prs.slides[slide_indices[1]], s2)
+                _replace_content_slide(prs.slides[content[1]], s2, slide_h)
 
     prs.save(str(output_path))
     return output_path

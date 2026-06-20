@@ -58,14 +58,15 @@ _USER = """[신규 제안 요청]
   "sections": [
     {{
       "section_name": "섹션명",
+      "act_tagline": "섹션 구분 슬라이드 임팩트 카피 (20자 이내, 질문형·선언형)",
       "headline": "슬라이드 핵심 헤드라인 ({max_headline}자 이내)",
       "subtitle": "헤드라인 보완 서브타이틀 (40자 초과 시 \\n 분리)",
       "bullets": [
-        "구체적 내용 1 ({max_bullet}자 이내)",
-        "구체적 내용 2",
-        "구체적 내용 3",
-        "구체적 내용 4",
-        "구체적 내용 5"
+        "항목명: 구체적 설명 ({max_bullet}자 이내)",
+        "항목명: 구체적 설명",
+        "항목명: 구체적 설명",
+        "항목명: 구체적 설명",
+        "항목명: 구체적 설명"
       ],
       "notes": "발표자 참고 노트"
     }}
@@ -156,25 +157,52 @@ def generate_draft(retrieve_result: Dict[str, Any]) -> Dict[str, Any]:
         max_bullets=MAX_BULLETS,
     )
 
-    # First call: main draft
+    # ④ 프롬프트 캐싱: system prompt와 references 블록을 캐시 경계로 지정.
+    #    - system prompt: 매 호출 동일 → 캐시 히트율 높음
+    #    - references 블록: 같은 top-3 문서가 재사용되면 캐시 히트
+    #    - 두 번째(slide-2) 호출은 동일 context를 재사용하므로 캐시 효과 극대화
+
+    # user_prompt를 references 부분과 나머지로 분리
+    ref_marker = "[참조 레퍼런스"
+    split_idx = user_prompt.find(ref_marker)
+    if split_idx != -1:
+        user_prompt_head = user_prompt[:split_idx].rstrip()
+        user_prompt_refs = user_prompt[split_idx:]
+    else:
+        user_prompt_head = user_prompt
+        user_prompt_refs = ""
+
+    cached_system = [{"type": "text", "text": system_prompt,
+                      "cache_control": {"type": "ephemeral"}}]
+
+    if user_prompt_refs:
+        cached_user_content = [
+            {"type": "text", "text": user_prompt_refs,
+             "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": user_prompt_head},
+        ]
+    else:
+        cached_user_content = [{"type": "text", "text": user_prompt}]
+
+    # ③ max_tokens 현실화: 8개 섹션 풀 콘텐츠 실측 ~4000-5000 토큰 → 8000으로 충분
     msg = _client.messages.create(
         model=LLM_MODEL,
-        max_tokens=16000,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
+        max_tokens=8000,
+        system=cached_system,
+        messages=[{"role": "user", "content": cached_user_content}],
     )
 
     raw = msg.content[0].text.strip()
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
     draft = json.loads(raw)
 
-    # Second call: slide-2 content for each section
+    # Second call: slide-2 — 앞선 호출과 동일 system+user context → 캐시 히트
     slide2_msg = _client.messages.create(
         model=LLM_MODEL,
         max_tokens=8000,
-        system=system_prompt,
+        system=cached_system,
         messages=[
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": cached_user_content},
             {"role": "assistant", "content": raw},
             {"role": "user", "content": _USER_SLIDE2},
         ],

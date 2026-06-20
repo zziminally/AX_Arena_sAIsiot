@@ -8,12 +8,13 @@ Flow:
 """
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional
 
 import anthropic
 
 from src.config import (
-    ANTHROPIC_API_KEY, LLM_MODEL,
+    ANTHROPIC_API_KEY, LLM_MODEL, ANALYZER_MODEL,
     TOP_K, FINAL_TOP_K, ALPHA,
 )
 from src.vector_store import search
@@ -69,14 +70,16 @@ _ANALYZER_USER = """[신규 제안 요청]
   "key_needs_keywords": ["핵심 니즈 키워드 3~7개"],
   "emphasized_values": ["강조 가치 2~4개"],
   "tone_and_manner": "톤앤매너 (위 패턴 중 가장 가까운 것)",
-  "query_text": "벡터 검색용 핵심 요약 (2~3문장, 산업군+캠페인 목적+체험 방식 포함)"
+  "query_text": "벡터 검색용 핵심 요약 (2~3문장, 산업군+캠페인 목적+체험 방식 포함)",
+  "client_name": "고객사 짧은 식별자 (2~5자, 예: 현대자동차→현대, 삼성전자→삼성. 입력에서 특정 회사명을 알 수 없으면 산업군 기반으로 표현 예: 식음료 대기업)",
+  "product_name": "제품·브랜드명 (2~5자, 알 수 없으면 '신제품' 또는 '신규 브랜드')"
 }}"""
 
 
 def analyze_request(user_input: str) -> Dict[str, Any]:
-    """LLM call 1: free-text input → structured query dict."""
+    """LLM call 1: free-text input → structured query dict. Uses Haiku for speed."""
     msg = _client.messages.create(
-        model=LLM_MODEL,
+        model=ANALYZER_MODEL,
         max_tokens=1024,
         messages=[{
             "role": "user",
@@ -85,7 +88,6 @@ def analyze_request(user_input: str) -> Dict[str, Any]:
         system=_ANALYZER_SYSTEM,
     )
     raw = msg.content[0].text.strip()
-    # Strip markdown code fences if present
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
     return json.loads(raw)
 
@@ -140,27 +142,32 @@ def _hybrid_score(semantic: float, metadata: float) -> float:
 def retrieve(user_input: str) -> Dict[str, Any]:
     """
     Full retrieval pipeline.
-    Returns:
-        {
-          "query": structured query dict,
-          "results": [
-            {
-              "doc_id": ...,
-              "score": hybrid_score,
-              "semantic_score": ...,
-              "metadata_score": ...,
-              "best_section": section_name,
-              "sections": [{ "section_name", "text", "semantic_score" }, ...]
-            },
-            ...
-          ]
-        }
+    ⑤ analyzer(Haiku)와 초기 벡터 검색을 ThreadPoolExecutor로 병렬 실행.
+       - 초기 검색: user_input 원문으로 임베딩 → 빠르게 후보 확보
+       - analyzer 완료 후: query_text로 정밀 검색 (refined)
+       두 결과를 합산해 중복 제거 후 hybrid scoring에 사용.
     """
-    # Step 1: Analyze request
-    query = analyze_request(user_input)
+    # Step 1+2: analyzer와 초기 검색 병렬 실행
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_query = pool.submit(analyze_request, user_input)
+        future_hits  = pool.submit(search, user_input, TOP_K * 3)
+        query    = future_query.result()
+        initial_hits = future_hits.result()
 
-    # Step 2: Semantic search (exclude company profile from main retrieval)
-    raw_hits = search(query["query_text"], n_results=TOP_K * 3)
+    # Step 2b: analyzer의 query_text로 정밀 검색 (user_input과 다를 때만)
+    if query["query_text"].strip() != user_input.strip():
+        refined_hits = search(query["query_text"], n_results=TOP_K * 3)
+    else:
+        refined_hits = []
+
+    # 두 결과 합산 (chunk_id 기준 중복 제거, refined 우선)
+    seen: set = set()
+    raw_hits: list = []
+    for hit in refined_hits + initial_hits:
+        chunk_id = hit["metadata"].get("doc_id", "") + hit["metadata"].get("section_name", "")
+        if chunk_id not in seen:
+            seen.add(chunk_id)
+            raw_hits.append(hit)
 
     # Step 3: Aggregate by doc_id (max pooling per document)
     doc_map: Dict[str, Dict] = {}
