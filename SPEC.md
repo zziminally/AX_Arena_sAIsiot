@@ -1,9 +1,10 @@
 # SPEC.md — ProposalPilot: 과거 제안서 레퍼런스 기반 신규 제안서 자동 구성 시스템
 
-> 상태: 초안 (승인 대기)  
+> 상태: **확정** (2026-06-20 승인 완료)  
 > 작성일: 2026-06-20  
 > 작성자: AI Product Engineer  
-> 파트너: 올림플래닛 (Olimplanet)
+> 파트너: 올림플래닛 (Olimplanet)  
+> 기술 스택: Option B 확정 (LangChain + ChromaDB + OpenAI Embeddings + Claude claude-sonnet-4-6 + Streamlit)
 
 ---
 
@@ -149,149 +150,107 @@
 
 ## 3. 데이터 스키마 설계
 
-### 3.1 메타데이터 필드 정의
+### 3.1 실제 데이터 현황 (docs/ 디렉토리 확인 기준)
 
-```json
-{
-  "doc_id": "string",           // 고유 식별자 (예: OP-2024-001)
-  "title": "string",            // 제안서 제목 (익명화 가능)
-  "industry": "string",         // 산업군 (자동차, 가전, 식음료, 패션, 금융, 게임, 등)
-  "client_type": "string",      // 고객사 유형 (대기업, 중견기업, 스타트업, 공공기관)
-  "client_scale": "string",     // 고객사 규모 (국내대기업, 글로벌, 중소)
-  "project_type": "string",     // 프로젝트 유형 (XR체험, 팝업스토어, 온라인캠페인, 오프라인이벤트, 하이브리드)
-  "proposal_stage": "string",   // 제안 단계 (1차제안, 2차제안, 최종제안, 수주후기획)
-  "included_sections": ["string"], // 포함 섹션 목록 (["배경분석","솔루션개요","캠페인기획","예산","레퍼런스"])
-  "emphasized_values": ["string"], // 강조 가치 (["몰입감","기술혁신","브랜드경험","바이럴","데이터수집"])
-  "proposal_purpose": "string", // 제안 목적 (신제품출시, 브랜드리뉴얼, 캠페인활성화, 신규고객유치)
-  "doc_year": "integer",        // 문서 연도 (2020-2025)
-  "key_needs_keywords": ["string"], // 주요 니즈 키워드 (["XR","체험마케팅","팝업","메타버스","AR필터"])
-  "tone_and_manner": "string",  // 톤앤매너 (프리미엄/테크니컬/감성적/트렌디/신뢰감)
-  "campaign_channel": ["string"], // 캠페인 채널 (["온라인","오프라인","소셜미디어","OOH"])
-  "outcome_metrics": ["string"],   // 성과 지표 (["노출수","체험자수","전환율","브랜드인지도"])
-  "file_path": "string",        // 원본 파일 경로
-  "content_summary": "string",  // LLM이 생성한 100자 이내 요약
-  "embedding_id": "string"      // Vector Store 내 레코드 ID
+| 항목 | 내용 |
+|------|------|
+| 메타데이터 파일 | `docs/document-metadata.csv` (21개 문서, 11개 컬럼) |
+| 제안서 파일 | `docs/과거 제안서 자료(가상데이터)/` (PPTX 22개, 중복 포함 21개 고유 문서) |
+| 산업군 분류 | 자동차(S1, 5개), 가전(S2, 5개), 식음료(S3, 5개), 확장 레퍼런스/부동산(S4, 6개) |
+| 슬라이드 구조 | 33슬라이드 / 문서 (섹션 구분 슬라이드 + 콘텐츠 슬라이드 패턴) |
+
+### 3.2 메타데이터 필드 정의 (실제 CSV 컬럼 기준)
+
+> CSV 컬럼명을 그대로 사용. 파이프(`|`) 구분자를 리스트로 파싱.
+
+```python
+# document-metadata.csv 실제 컬럼 → 내부 필드명 매핑
+FIELD_MAP = {
+    "문서 ID":          "doc_id",           # "OP-S1-01"
+    "산업군":           "industry",          # "자동차" | "가전" | "식음료" | "확장 레퍼런스" | "부동산"
+    "고객사 유형":       "client_type",       # "자동차 제조 기업" | "프리미엄 가전 브랜드" | ...
+    "제안 목적":        "proposal_purpose",  # "신차 런칭 통합 체험 전략 수립" | ...
+    "프로젝트 유형":     "project_type",      # "브랜드/캠페인 전략" | "프로젝트/공간 기획" |
+                                            #  "XR/디지털 콘텐츠 설계" | "고객 여정/CRM 설계" |
+                                            #  "콘텐츠 연출/스토리텔링" | "운영/KPI 관리"
+    "문서 연도":        "doc_year",          # 2025 (정수)
+    "제안 단계":        "proposal_stage",    # "전략 제안" | "공간 기획 제안" | "콘텐츠 설계 제안" |
+                                            #  "운영 제안" | "전환 설계 제안" | "프레임워크 제안" | ...
+    "주요 니즈 키워드":  "key_needs_keywords",# "신차 런칭|통합 체험 캠페인|XR 시승" → 리스트 파싱
+    "포함 섹션":        "included_sections", # "제안 배경|사업 이해|추진 전략|..." → 리스트 파싱
+    "톤앤매너":         "tone_and_manner",   # "프리미엄·전략적·설득형" | "기술지향·정교한·설계형" | ...
+    "강조 가치":        "emphasized_values", # "브랜드 신뢰|기술 이해|리드 전환" → 리스트 파싱
+}
+
+# 추가 파생 필드 (CSV에 없음 — 시스템이 생성)
+DERIVED_FIELDS = {
+    "file_path":    "str",  # "docs/과거 제안서 자료(가상데이터)/OP-S1-01_신차-런칭-...pptx"
+    "slide_texts":  "dict", # { section_name: [slide_text, ...] } — PPTX 파싱 결과
 }
 ```
 
-### 3.2 Mock 데이터 예시 (5개)
+**`프로젝트 유형` 실제 값과 검색 매핑**
 
-```json
-[
-  {
-    "doc_id": "OP-2023-001",
-    "title": "[자동차A사] 전기차 신모델 XR 체험 마케팅 제안",
-    "industry": "자동차",
-    "client_type": "대기업",
-    "client_scale": "국내대기업",
-    "project_type": "XR체험",
-    "proposal_stage": "1차제안",
-    "included_sections": ["배경분석", "트렌드분석", "솔루션개요", "체험시나리오", "기대효과", "예산일정", "레퍼런스"],
-    "emphasized_values": ["기술혁신", "몰입감", "브랜드경험"],
-    "proposal_purpose": "신제품출시",
-    "doc_year": 2023,
-    "key_needs_keywords": ["XR", "전기차", "온라인체험", "가상시승", "디지털트윈"],
-    "tone_and_manner": "테크니컬",
-    "campaign_channel": ["온라인", "소셜미디어"],
-    "outcome_metrics": ["체험자수", "브랜드인지도", "전환율"],
-    "content_summary": "전기차 신모델 출시 맞춤 XR 가상 시승 체험 캠페인. 온라인 랜딩페이지와 AR 기술 결합."
-  },
-  {
-    "doc_id": "OP-2023-002",
-    "title": "[가전B사] 프리미엄 냉장고 출시 오프라인 체험 제안",
-    "industry": "가전",
-    "client_type": "대기업",
-    "client_scale": "국내대기업",
-    "project_type": "하이브리드",
-    "proposal_stage": "1차제안",
-    "included_sections": ["배경분석", "솔루션개요", "체험시나리오", "공간설계", "기대효과", "예산일정"],
-    "emphasized_values": ["프리미엄", "라이프스타일", "몰입감"],
-    "proposal_purpose": "신제품출시",
-    "doc_year": 2023,
-    "key_needs_keywords": ["프리미엄", "오프라인체험", "XR확장", "라이프스타일", "팝업"],
-    "tone_and_manner": "프리미엄",
-    "campaign_channel": ["오프라인", "온라인"],
-    "outcome_metrics": ["체험자수", "브랜드인지도"],
-    "content_summary": "프리미엄 가전 신제품 오프라인 팝업 체험 후 XR로 연결하는 하이브리드 캠페인."
-  },
-  {
-    "doc_id": "OP-2022-003",
-    "title": "[식음료C사] 브랜드 리뉴얼 팝업 체험 제안",
-    "industry": "식음료",
-    "client_type": "대기업",
-    "client_scale": "국내대기업",
-    "project_type": "팝업스토어",
-    "proposal_stage": "1차제안",
-    "included_sections": ["배경분석", "캠페인기획", "공간체험설계", "디지털확장", "기대효과", "예산"],
-    "emphasized_values": ["브랜드경험", "감성적", "바이럴", "트렌디"],
-    "proposal_purpose": "브랜드리뉴얼",
-    "doc_year": 2022,
-    "key_needs_keywords": ["팝업", "브랜드경험", "SNS바이럴", "몰입형콘텐츠", "MZ타겟"],
-    "tone_and_manner": "감성적",
-    "campaign_channel": ["오프라인", "소셜미디어"],
-    "outcome_metrics": ["방문자수", "SNS노출수", "브랜드인지도"],
-    "content_summary": "식음료 브랜드 리뉴얼 맞춤 팝업 스토어 기획. SNS 바이럴 연동 몰입형 공간 체험."
-  },
-  {
-    "doc_id": "OP-2024-004",
-    "title": "[패션D사] 신시즌 컬렉션 AR 필터 캠페인 제안",
-    "industry": "패션",
-    "client_type": "대기업",
-    "client_scale": "글로벌",
-    "project_type": "온라인캠페인",
-    "proposal_stage": "2차제안",
-    "included_sections": ["배경분석", "솔루션개요", "AR필터설계", "소셜전략", "기대효과"],
-    "emphasized_values": ["트렌디", "바이럴", "감성적"],
-    "proposal_purpose": "캠페인활성화",
-    "doc_year": 2024,
-    "key_needs_keywords": ["AR필터", "인스타그램", "소셜바이럴", "컬렉션체험", "글로벌"],
-    "tone_and_manner": "트렌디",
-    "campaign_channel": ["소셜미디어", "온라인"],
-    "outcome_metrics": ["필터사용수", "SNS노출수", "팔로워증가"],
-    "content_summary": "패션 신시즌 컬렉션 AR 필터 기반 소셜 캠페인. 글로벌 MZ 타겟."
-  },
-  {
-    "doc_id": "OP-2024-005",
-    "title": "[자동차E사] 브랜드 헤리티지 메타버스 체험관 제안",
-    "industry": "자동차",
-    "client_type": "대기업",
-    "client_scale": "글로벌",
-    "project_type": "XR체험",
-    "proposal_stage": "1차제안",
-    "included_sections": ["배경분석", "트렌드분석", "메타버스전략", "체험시나리오", "기술스택", "예산일정"],
-    "emphasized_values": ["기술혁신", "브랜드경험", "몰입감"],
-    "proposal_purpose": "브랜드리뉴얼",
-    "doc_year": 2024,
-    "key_needs_keywords": ["메타버스", "브랜드헤리티지", "XR", "가상전시관", "글로벌캠페인"],
-    "tone_and_manner": "테크니컬",
-    "campaign_channel": ["온라인", "소셜미디어"],
-    "outcome_metrics": ["방문자수", "체류시간", "브랜드인지도"],
-    "content_summary": "글로벌 자동차 브랜드 헤리티지를 메타버스 가상 전시관으로 구현하는 XR 체험 제안."
-  }
-]
-```
+| CSV 값 | 검색 시 대응 키워드 |
+|--------|-----------------|
+| 브랜드/캠페인 전략 | 전략, 캠페인, 브랜드 전략 |
+| 프로젝트/공간 기획 | 팝업, 공간, 쇼룸, 체험존 |
+| XR/디지털 콘텐츠 설계 | XR, AR, 콘텐츠, 디지털, 메타버스 |
+| 고객 여정/CRM 설계 | 여정, 전환, CRM, 리드, 재방문 |
+| 콘텐츠 연출/스토리텔링 | 스토리보드, 연출, 세계관, 내러티브 |
+| 운영/KPI 관리 | 운영, KPI, 성과, 관리 |
 
-### 3.3 청킹(Chunking) 전략
+### 3.3 PPTX 슬라이드 구조 (실제 파일 분석 결과)
+
+> OP-S1-01 (33슬라이드) 기준으로 파악한 공통 패턴
 
 ```
-문서 단위 청킹 vs. 섹션 단위 청킹
+[표지] Slide 1 — 제목 + 부제 (1슬라이드)
+[목차] Slide 2 — CONTENTS / 섹션 목록 (1슬라이드)
 
-→ 섹션 단위 청킹 채택 이유:
-  - 제안서는 명확한 섹션 구조를 가짐 (배경분석, 솔루션, 예산 등)
-  - 섹션 단위로 검색하면 "예산 섹션만 참조"처럼 세밀한 재사용 가능
-  - 단, 문서 수준 메타데이터는 모든 청크에 공유
+[섹션 구분] Slide N — 섹션명 단독 표시 (대형 텍스트)
+[콘텐츠]   Slide N+1 — 섹션헤더 + 슬라이드 제목 + 본문
+[콘텐츠]   Slide N+2 — 섹션헤더 + 슬라이드 제목 + 본문
+...
+```
 
-청크 구조:
+**OP-S1-01 기준 섹션 구조 (8개 섹션 × 3~6슬라이드)**
+
+| 섹션 순서 | 섹션명 | 슬라이드 수 |
+|---------|--------|-----------|
+| 01 | 제안 배경 또는 문제 정의 | 2 |
+| 02 | 사업 이해 또는 고객/시장 이해 | 3 |
+| 03 | 제안 목적 | 2 |
+| 04 | 추진 전략 또는 제안 프레임 | 9 |
+| 05 | 세부 실행 방안 | 5 |
+| 06 | 운영 및 관리 체계 | 4 |
+| 07 | 성과 측정 또는 검증 기준 | 3 |
+| 08 | 기대효과 또는 결론 | 3 |
+
+### 3.4 청킹(Chunking) 전략
+
+섹션 단위 청킹 채택 — 제안서의 명확한 섹션 구조를 그대로 활용하므로 의미 단위 훼손 없음.
+
+```python
+# 청크 단위: 섹션 구분 슬라이드 이후 연속된 콘텐츠 슬라이드 텍스트 합산
 {
-  "chunk_id": "OP-2023-001_sec_02",
-  "doc_id": "OP-2023-001",
-  "section_name": "솔루션개요",
-  "section_order": 2,
-  "text": "...",
-  "embedding": [...],
-  "metadata": { /* 문서 메타데이터 전체 참조 */ }
+    "chunk_id":      "OP-S1-01_sec_04",           # doc_id + 섹션 인덱스
+    "doc_id":        "OP-S1-01",
+    "section_name":  "추진 전략 또는 제안 프레임",
+    "section_order": 4,
+    "text":          "...",                        # 해당 섹션 모든 슬라이드 텍스트 병합
+    "metadata": {                                  # CSV 메타데이터 전체 포함
+        "industry":          "자동차",
+        "project_type":      "브랜드/캠페인 전략",
+        "proposal_purpose":  "신차 런칭 통합 체험 전략 수립",
+        "tone_and_manner":   "프리미엄·전략적·설득형",
+        "emphasized_values": ["브랜드 신뢰", "기술 이해", "리드 전환"],
+        ...
+    }
 }
 ```
+
+**섹션 구분 감지 로직**: 슬라이드 텍스트에서 `OLIMPLANET`, `© OLIMPLANET Reference Asset`, 페이지 번호를 제거한 뒤 짧은 단일 텍스트(≤ 30자)만 남으면 섹션 구분 슬라이드로 판단.
 
 ---
 
@@ -339,22 +298,22 @@
 | 필드 | 필터 유형 | 로직 |
 |------|----------|------|
 | `industry` | 소프트 매칭 | 정확 일치 우선, 없으면 유사 산업군 허용 |
-| `project_type` | 소프트 매칭 | 요청에 명시된 유형 우선 |
-| `doc_year` | 범위 | 최근 3년 기본, 하드 필터 없으면 전체 |
-| `client_scale` | 선택적 | 요청에 명시된 경우만 적용 |
+| `project_type` | 소프트 매칭 | 요청 키워드 → 3.2절 매핑표 기준 후보 유형 선별 |
+| `doc_year` | 범위 | 최근 3년 기본 (현재 데이터 전부 2025년이므로 사실상 전체) |
 
-**산업군 유사성 맵** (하드 필터 완화 로직)
+**산업군 유사성 맵** (실제 데이터 기준 확장)
 
 ```python
 INDUSTRY_SIMILARITY_MAP = {
-    "자동차": ["모빌리티", "이동수단"],
-    "가전": ["전자", "생활가전", "IT기기"],
-    "식음료": ["F&B", "식품", "음료"],
-    "패션": ["뷰티", "라이프스타일"],
-    "금융": ["보험", "핀테크"],
-    "게임": ["엔터테인먼트", "미디어"]
+    "자동차":     ["모빌리티", "자동차 제조", "전기차"],
+    "가전":       ["전자", "생활가전", "프리미엄 가전"],
+    "식음료":     ["F&B", "식품", "음료", "외식", "프랜차이즈", "레스토랑"],
+    "확장 레퍼런스": [],  # 산업군 불문 활용 가능한 프레임워크 문서
+    "부동산":     ["분양", "시행사", "체험관"],
 }
 ```
+
+> **확장 레퍼런스(S4) 처리**: 산업군 매칭 실패 시 fallback 후보군으로 항상 포함. 온오프라인 통합 여정, XR 모듈 재사용, KPI 설계 등 범용 프레임워크 문서이므로 어떤 산업 요청에도 보조 참조 가능.
 
 ### 4.3 임베딩 모델 선택
 
@@ -375,43 +334,77 @@ INDUSTRY_SIMILARITY_MAP = {
 ### 4.4 유사도 계산 및 top-k 선정 로직
 
 ```python
-def hybrid_score(doc, query_metadata, semantic_sim):
+def hybrid_score(doc_metadata, query_metadata, semantic_sim):
     """
-    metadata_score: 메타데이터 필드 매칭 점수
-    semantic_score: 코사인 유사도 (0~1)
-    alpha: 메타데이터 가중치 (0.4 기본값)
+    실제 CSV 필드를 기준으로 메타데이터 매칭 점수 계산.
+    가중치가 다른 이유: industry 불일치는 제안서 적합성에 치명적,
+    project_type은 비슷한 유형이 많으므로 부분 점수 허용.
     """
-    meta_fields = ["industry", "project_type", "proposal_purpose", "client_type"]
-    match_count = sum(1 for f in meta_fields if doc[f] == query_metadata.get(f))
-    metadata_score = match_count / len(meta_fields)
+    score = 0.0
 
-    alpha = 0.4
+    # industry: 가중치 높음 (정확 일치 0.5, 유사 산업군 0.25)
+    if doc_metadata["industry"] == query_metadata.get("industry"):
+        score += 0.5
+    elif doc_metadata["industry"] in INDUSTRY_SIMILARITY_MAP.get(
+            query_metadata.get("industry", ""), []):
+        score += 0.25
+    elif doc_metadata["industry"] == "확장 레퍼런스":
+        score += 0.1  # fallback 가산점
+
+    # project_type: 키워드 겹침 기반 부분 점수
+    q_type_keywords = PROJECT_TYPE_KEYWORDS.get(query_metadata.get("project_type", ""), set())
+    d_type_keywords = PROJECT_TYPE_KEYWORDS.get(doc_metadata.get("project_type", ""), set())
+    overlap = len(q_type_keywords & d_type_keywords) / max(len(q_type_keywords), 1)
+    score += 0.3 * overlap
+
+    # key_needs_keywords: 교집합 비율
+    q_kw = set(query_metadata.get("key_needs_keywords", []))
+    d_kw = set(doc_metadata.get("key_needs_keywords", []))
+    if q_kw:
+        score += 0.2 * len(q_kw & d_kw) / len(q_kw)
+
+    metadata_score = min(score, 1.0)
+
+    alpha = 0.4  # 메타데이터 40%, 시맨틱 60%
     return alpha * metadata_score + (1 - alpha) * semantic_sim
 
 # top-k 선정: 하이브리드 점수 기준 상위 3개
-# 단, 동일 문서의 복수 청크는 문서 수준으로 집계 (max pooling)
+# 동일 doc_id의 복수 청크는 최고 점수 청크만 대표로 선택 (max pooling)
+# 단, 같은 project_type만 top-3를 차지하지 않도록 다양성 보장
+#   → 동일 project_type 최대 2개 제한
 ```
 
 ---
 
 ## 5. 초안 생성 모듈 설계
 
-### 5.1 PPT 슬라이드 구조 (디자인 양식 기준)
+### 5.1 PPT 출력 전략 (실제 PPTX 파일 기반 템플릿 접근)
 
-실제 디자인 양식 파일 수령 전, 아래 표준 구조를 기본 템플릿으로 가정합니다.
+**별도 디자인 양식 파일 없음** — 검색된 top-1 PPTX를 구조·디자인 템플릿으로 복사한 뒤 텍스트만 교체하는 방식 채택.
 
-| 슬라이드 번호 | 섹션명 | 역할 |
-|-------------|--------|------|
-| 1 | 표지 (Cover) | 제안명, 고객사, 날짜, 올림플래닛 로고 |
-| 2 | 목차 (Contents) | 섹션 목록 자동 생성 |
-| 3 | 제안 배경 (Background) | 시장 트렌드, 고객사 니즈 |
-| 4 | 트렌드 분석 (Trend) | XR·이머시브 시장 현황 |
-| 5 | 솔루션 개요 (Solution) | 핵심 제안 1~2페이지 |
-| 6-7 | 캠페인 기획 (Campaign Plan) | 체험 시나리오, 콘텐츠 구성 |
-| 8 | 기대 효과 (Expected Outcome) | 정량/정성 KPI |
-| 9 | 예산 및 일정 (Budget & Timeline) | 예산 구조, 일정표 |
-| 10 | 올림플래닛 레퍼런스 (Reference) | 유사 수행 사례 |
-| 11 | 마무리 (Closing) | 연락처, CTA |
+```
+이유: 소스 PPTX 21개 모두 동일한 올림플래닛 디자인 언어를 공유.
+      별도 템플릿 없이도 복사 + 텍스트 교체만으로 동일한 디자인 품질 유지 가능.
+      python-pptx로 텍스트 프레임을 찾아 내용만 교체 → 배경·레이아웃·폰트 보존.
+```
+
+**출력 PPT 슬라이드 구성** (top-1 문서 구조 기준, 33슬라이드)
+
+| 슬라이드 | 타입 | 처리 방식 |
+|---------|------|---------|
+| 1 | 표지 | 제목·부제 텍스트 교체 (신규 요청 정보 반영) |
+| 2 | 목차 | 섹션명 리스트 교체 |
+| N (구분 슬라이드) | 섹션 타이틀 | 섹션명 텍스트 유지 또는 교체 |
+| N+1 ~ N+k (콘텐츠) | 본문 | LLM 생성 텍스트로 교체 |
+
+**텍스트 교체 로직**
+
+```python
+# 섹션 구분 슬라이드 감지: 유효 텍스트 ≤ 30자 → 섹션 타이틀 슬라이드
+# 콘텐츠 슬라이드: 섹션헤더(좌상단 소형) + 슬라이드 제목(대형) + 본문(불릿)
+# 교체 순서: section_header → slide_title → body_bullets
+# 단, 이미지/도형에 삽입된 텍스트는 건드리지 않음 (디자인 보호)
+```
 
 ### 5.2 초안 생성 워크플로우
 
@@ -436,29 +429,35 @@ python-pptx로 디자인 템플릿에 텍스트 삽입
 
 #### Prompt A — Request Analyzer (1차 LLM 호출)
 
+> 출력 필드는 실제 CSV 컬럼명과 일치시켜 필터링에 바로 활용.
+
 ```
 SYSTEM:
 당신은 올림플래닛의 시니어 제안 매니저입니다.
-사용자가 입력한 신규 제안 요청을 분석하여 구조화된 JSON으로 변환하십시오.
+사용자의 신규 제안 요청을 분석하여 아래 JSON 형식으로 구조화하십시오.
+
+[참조 가능한 산업군]: 자동차, 가전, 식음료, 패션, 금융, 부동산, 기타
+[참조 가능한 프로젝트 유형]: 브랜드/캠페인 전략, 프로젝트/공간 기획, XR/디지털 콘텐츠 설계,
+                            고객 여정/CRM 설계, 콘텐츠 연출/스토리텔링, 운영/KPI 관리
+[참조 가능한 톤앤매너 패턴]: 프리미엄·전략적·설득형, 기술지향·정교한·설계형,
+                            감성적·라이프스타일형·기획형, 운영중심·체계적·관리형
 
 USER:
 [신규 제안 요청]
 {user_input}
 
-[출력 형식]
+[출력 형식 — JSON only]
 {
-  "industry": "산업군 (자동차/가전/식음료/패션/금융/기타)",
-  "client_type": "고객사 유형 (대기업/중견기업/스타트업/공공기관)",
-  "client_scale": "규모 (국내대기업/글로벌/중소)",
-  "project_type": "프로젝트 유형 (XR체험/팝업스토어/온라인캠페인/하이브리드)",
-  "proposal_purpose": "제안 목적 (신제품출시/브랜드리뉴얼/캠페인활성화)",
-  "emphasized_values": ["강조 가치 목록"],
-  "key_needs_keywords": ["핵심 키워드 목록"],
-  "query_text": "벡터 검색에 사용할 핵심 요약 문장 (100자 이내)",
-  "tone_and_manner": "톤앤매너 (프리미엄/테크니컬/감성적/트렌디/신뢰감)"
+  "industry": "산업군",
+  "client_type": "고객사 유형 설명",
+  "project_type": "프로젝트 유형 (위 목록 중 가장 가까운 것, 복수 가능)",
+  "proposal_purpose": "제안 목적 한 문장",
+  "proposal_stage": "제안 단계 추정 (전략 제안/공간 기획 제안/콘텐츠 설계 제안 등)",
+  "key_needs_keywords": ["핵심 니즈 키워드 3~7개"],
+  "emphasized_values": ["강조 가치 2~4개"],
+  "tone_and_manner": "톤앤매너 (위 패턴 중 가장 가까운 것)",
+  "query_text": "벡터 검색용 핵심 요약 (2~3문장, 산업군+캠페인 목적+체험 방식 포함)"
 }
-
-반드시 JSON만 출력하십시오.
 ```
 
 #### Prompt B — Draft Generator (2차 LLM 호출, 섹션별)
@@ -512,93 +511,56 @@ USER:
 
 ## 6. 기술 스택 제안
 
-### 6.1 대안 비교
+### 6.1 확정 기술 스택 (Option B — 승인 완료)
 
-#### Option A — "경량 로컬" (빠른 MVP, 오프라인 가능)
+| 구성요소 | 선택 | 선택 이유 |
+|---------|------|---------|
+| 언어 | Python 3.11 | - |
+| RAG 프레임워크 | LangChain | 검증된 RAG 패턴, ChromaDB 네이티브 통합 |
+| Vector Store | **ChromaDB (로컬)** | 외부 서비스 불필요, 파일 기반 영속성 |
+| Embedding | `text-embedding-3-small` (OpenAI) | 한국어 품질 검증, 1536-dim, $0.02/1M tokens |
+| LLM | **Claude claude-sonnet-4-6** (Anthropic API) | 한국어 장문 생성 최강, 구조화된 JSON 출력 안정적 |
+| PPT 생성 | python-pptx | 소스 PPTX 복사 + 텍스트 교체 방식에 최적 |
+| UI | Streamlit | 웹 기반 데모 시연, 파일 다운로드 내장 지원 |
+| 의존성 관리 | pip + requirements.txt | 단순 설치 구조 |
 
-| 구성요소 | 선택 | 이유 |
-|---------|------|------|
-| 언어/프레임워크 | Python 3.11 + 순수 구현 | 의존성 최소화 |
-| Vector Store | ChromaDB (로컬) | 설치 불필요, 파일 기반 |
-| Embedding | `multilingual-e5-large` (HuggingFace) | API 비용 없음, 로컬 실행 |
-| LLM | Claude claude-sonnet-4-6 (Anthropic API) | 한국어 최강, 장문 생성 우수 |
-| PPT 생성 | python-pptx | 무료, 풍부한 문서 |
-| UI | CLI (터미널) | MVP 최소 구현 |
+**데이터 흐름별 API 호출 비용 추산 (21개 문서 기준)**
 
-**장점**: API 비용 최소, 데이터 외부 유출 없음, 설치 간단  
-**단점**: 임베딩 모델 로컬 구동 (초기 로딩 10~30초), 확장성 제한
-
----
-
-#### Option B — "클라우드 표준" (품질 최우선, 데모 완성도 높음)
-
-| 구성요소 | 선택 | 이유 |
-|---------|------|------|
-| 언어/프레임워크 | Python 3.11 + LangChain | 검증된 RAG 패턴 |
-| Vector Store | ChromaDB (로컬) 또는 Pinecone | 로컬로 시작, 운영 시 Pinecone |
-| Embedding | `text-embedding-3-small` (OpenAI) | 한국어 품질 높음 |
-| LLM | Claude claude-sonnet-4-6 (Anthropic API) | 한국어 최강 |
-| PPT 생성 | python-pptx | 무료, 안정적 |
-| UI | Streamlit (웹 UI) | 데모 시연 효과적 |
-
-**장점**: 높은 임베딩 품질, 웹 UI로 데모 시연 용이, LangChain 생태계  
-**단점**: OpenAI + Anthropic 이중 API 비용, LangChain 추상화 복잡성
-
----
-
-#### Option C — "풀스택 최소화" (균형형, 권장안)
-
-| 구성요소 | 선택 | 이유 |
-|---------|------|------|
-| 언어/프레임워크 | Python 3.11 + 경량 커스텀 파이프라인 | LangChain 없이 직접 구현 (평가자에게 워크플로우 명확히 보여줌) |
-| Vector Store | ChromaDB (로컬) | 설치 불필요 |
-| Embedding | `text-embedding-3-small` (OpenAI) | 한국어 품질 보장 |
-| LLM | Claude claude-sonnet-4-6 (Anthropic API) | 한국어 최강 |
-| PPT 생성 | python-pptx | 무료, 안정적 |
-| UI | Streamlit (웹 UI, MVP 이후) | 데모 친화적 |
-
-**장점**: 워크플로우 각 단계가 명확히 드러남 (심사 기준 "데이터·프롬프트·워크플로우 설계" 어필), 비용 적정, 확장 용이  
-**단점**: LangChain 없이 RAG 로직 직접 구현 (코드량 증가, 약 20~30% 더 작성)
-
-### 6.2 대안 비교 요약
-
-| 항목 | Option A (경량) | Option B (클라우드) | Option C (균형·권장) |
-|------|---------------|-------------------|-------------------|
-| MVP 완성 속도 | ★★★ | ★★ | ★★★ |
-| 임베딩 품질 | ★★ | ★★★ | ★★★ |
-| 데모 시연 효과 | ★★ | ★★★ | ★★★ |
-| 워크플로우 투명성 | ★★★ | ★★ | ★★★ |
-| API 비용 | ★★★ (최저) | ★★ | ★★ |
-| 확장 가능성 | ★★ | ★★★ | ★★★ |
-| 평가 항목 대응 | 높음 | 높음 | **가장 높음** |
-
-> ⚠️ **승인 전 확인 필요**: 기술 스택 최종 결정은 아래 [미결 질문] 섹션 참조. **Option C를 권장**하지만 보안 요건(내부 데이터 외부 전송 제한) 여부에 따라 Option A로 변경됩니다.
+| 단계 | API | 예상 토큰 | 예상 비용 |
+|------|-----|---------|---------|
+| 인덱싱 (1회) | OpenAI Embeddings | ~200K | ~$0.004 |
+| 검색 쿼리 임베딩 | OpenAI Embeddings | ~500 / 회 | 무시 가능 |
+| Request Analyzer | Claude claude-sonnet-4-6 | ~500 in / 200 out | ~$0.002 / 회 |
+| Draft Generator (섹션별) | Claude claude-sonnet-4-6 | ~2K in / 500 out × 8섹션 | ~$0.05 / 회 |
+| **총 1회 제안서 생성** | | | **≈ $0.05** |
 
 ---
 
 ## 7. 단계별 구현 로드맵
 
-### Phase 0 — 환경 설정 및 Mock 데이터 구축 (0.5일)
+### Phase 0 — 환경 설정 (0.5일)
 
-**목표**: 실제 데이터 없이도 파이프라인 테스트 가능한 환경 구축
+**목표**: 실제 데이터(docs/)를 파이프라인에 연결 가능한 환경 구축  
+> Mock 데이터 불필요 — `docs/document-metadata.csv` (21개) + PPTX 22개 이미 확보
 
 **완료 기준**:
-- [ ] Python 가상환경, 의존성 설치 완료
-- [ ] Mock 제안서 20개 (텍스트 기반) + 메타데이터 JSON 생성
-- [ ] ChromaDB 로컬 인스턴스 정상 기동
-- [ ] OpenAI/Anthropic API 키 연결 확인
+- [ ] Python 가상환경 + `requirements.txt` 의존성 설치 완료
+- [ ] `.env` 파일에 `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` 설정
+- [ ] `python -c "import chromadb, langchain, streamlit, pptx"` 오류 없음
+- [ ] `docs/document-metadata.csv` 로딩 및 필드 파싱 검증 (21행, 11컬럼)
 
 ---
 
 ### Phase 1 — 인덱싱 파이프라인 (1일)
 
-**목표**: 과거 제안서 → Vector Store 자동 인덱싱
+**목표**: `docs/` 내 PPTX 21개 → ChromaDB 자동 인덱싱
 
 **완료 기준**:
-- [ ] Ingestor: PDF/PPTX/DOCX 파싱 및 섹션 단위 청킹
-- [ ] 메타데이터 JSON 로딩 및 검증
-- [ ] 임베딩 생성 및 ChromaDB 저장
-- [ ] `python ingest.py --data-dir ./data/proposals` 명령어 1회 실행으로 전체 인덱싱 완료
+- [ ] Ingestor: PPTX 파싱 (python-pptx) + 섹션 구분 슬라이드 감지 로직 동작
+- [ ] 섹션 단위 청킹 → 21문서 × 8섹션 평균 ≈ 168개 청크 생성
+- [ ] CSV 메타데이터 파싱 (파이프 구분자 처리 포함) + 청크에 결합
+- [ ] `text-embedding-3-small` 임베딩 생성 후 ChromaDB 저장
+- [ ] `python ingest.py` 명령어 1회 실행으로 전체 인덱싱 완료 (소요 ≤ 2분)
 
 ---
 
@@ -640,10 +602,10 @@ USER:
 
 ### Phase 5 — 고도화 (선택, 여유 시간 발생 시)
 
-- 실제 제안서 데이터 수령 후 실데이터 인덱싱
-- 디자인 양식 파일 수령 후 PPT 템플릿 정교화
-- 추천 근거 설명 기능 (어떤 레퍼런스가 왜 선택됐는지 사용자에게 표시)
-- 섹션별 재생성 기능 (특정 슬라이드만 다시 생성)
+- 추천 근거 UI 시각화 (어떤 레퍼런스가 왜 선택됐는지 Streamlit에 표시)
+- 섹션별 재생성 버튼 (특정 슬라이드 콘텐츠만 다시 생성)
+- α 값 튜닝 UI (메타데이터 vs 시맨틱 가중치 실시간 조절)
+- 생성된 초안 PDF 내보내기 (LibreOffice 또는 Microsoft Graph API)
 - 피드백 루프 (추천 결과 평가 → 향후 검색 품질 개선)
 
 ---
@@ -674,13 +636,12 @@ USER:
 
 | 리스크 | 가능성 | 영향 | 대안 |
 |--------|--------|------|------|
-| 실제 제안서 데이터 미수령 | 중 | 중 | Mock 데이터 20개로 파이프라인 구현 후, 수령 시 재인덱싱 |
-| 디자인 양식 파일 미수령 | 중 | 중 | 기본 PPT 템플릿으로 구조 구현 후, 수령 시 디자인 교체 |
-| OpenAI API 비용 초과 | 저 | 저 | 임베딩은 1회만 발생(인덱싱 시), 운영 중 비용 미미. 필요시 로컬 임베딩 전환 |
-| 보안 요건 (내부 데이터 외부 API 전송 금지) | 불확실 | 高 | Option A (로컬 임베딩 + Anthropic API만 사용) 로 전환. 또는 완전 로컬 LLM(Ollama) 검토 |
-| 한국어 PPT 생성 품질 | 중 | 중 | 프롬프트 튜닝, few-shot 예시 추가, 사람 검토 단계 명시 |
-| LLM 할루시네이션 | 저 | 중 | 레퍼런스 섹션을 직접 context로 주입(RAG), 생성 후 사람 검토 필수 안내 |
-| python-pptx 디자인 한계 | 중 | 저 | 텍스트 콘텐츠 생성에 집중, 디자인 정교화는 담당자 후처리로 안내 |
+| PPTX 텍스트 교체 시 레이아웃 깨짐 | 중 | 중 | 텍스트 길이 제한 (헤드라인 ≤ 40자, 불릿 ≤ 60자) + 폰트 크기 자동 조절 |
+| 섹션 구분 슬라이드 감지 오류 | 저 | 중 | 감지 로직 fallback: 30자 기준 + 폰트 크기 임계값 병행 |
+| 한국어 LLM 생성 품질 편차 | 중 | 중 | few-shot 예시를 Prompt B에 추가, 생성 후 사람 검토 필수 안내 |
+| LLM 할루시네이션 | 저 | 중 | 레퍼런스 섹션 텍스트를 직접 context로 주입(RAG) — 생성 근거 추적 가능 |
+| OpenAI API 비용 | 저 | 저 | 인덱싱 1회 ~$0.004, 생성 1회 ~$0.05 — 테스트 10회 = $0.5 수준 |
+| 21개 문서로 커버 안 되는 산업군 요청 | 중 | 중 | 확장 레퍼런스(S4) fallback + "유사 구조 참조" 명시하여 생성 품질 보완 |
 
 ---
 
@@ -733,40 +694,21 @@ USER:
 
 ---
 
-## 11. 미결 질문 (승인 전 확인 필요)
+## 11. 확정 사항 요약
 
-SPEC.md 검토 중 아래 항목에 대해 답변 부탁드립니다. 일부는 기술 스택과 구현 방식에 직접 영향을 줍니다.
+모든 미결 질문 답변 완료 — 구현 즉시 시작 가능.
 
-### 필수 확인 (구현 방향 결정)
+| 항목 | 확정 내용 |
+|------|---------|
+| 외부 API 사용 | ✅ 허용 (OpenAI Embeddings + Anthropic Claude) |
+| 소스 데이터 | ✅ `docs/document-metadata.csv` + PPTX 21개 확보 |
+| PPT 템플릿 | ✅ 별도 템플릿 없음 → 검색된 PPTX 복사 + 텍스트 교체 방식 |
+| 기술 스택 | ✅ Option B (LangChain + ChromaDB + OpenAI + Claude + Streamlit) |
+| Vector Store | ✅ ChromaDB만 사용 (Pinecone 제외) |
+| UI | ✅ Streamlit 웹 UI |
 
-**Q1. 데이터 보안 요건**  
-과거 제안서 텍스트를 외부 API (OpenAI Embeddings, Anthropic Claude)로 전송해도 됩니까?  
-→ "안 된다"면 Option A (로컬 임베딩 + 프라이빗 환경)로 변경 필요.
-
-**Q2. 실제 제안서 데이터 수령 가능 여부 및 시점**  
-데이터가 없다면 Mock 20개로 전체 파이프라인을 구현하고, 데모는 Mock 기반으로 진행합니까?
-
-**Q3. 디자인 양식(PPT 템플릿) 파일**  
-실제 올림플래닛 PPT 템플릿 파일을 받을 수 있습니까?  
-→ 없다면 기본 레이아웃으로 구현 후 추후 교체 구조로 설계합니다.
-
-**Q4. 기술 스택 선호**  
-Option A / B / C 중 선호하는 방향이 있습니까? (권장: Option C)  
-→ 또는 Streamlit UI가 꼭 필요한지, CLI 데모로도 충분한지 확인.
-
-### 참고 확인 (설계 완성도 향상)
-
-**Q5. 발표 환경**  
-발표 시 라이브 데모를 실행합니까, 아니면 녹화 영상으로 대체합니까?  
-→ 라이브라면 인터넷 연결 여부, 실행 환경(Mac/Windows/웹) 확인 필요.
-
-**Q6. 최종 산출물 형식**  
-.pptx 파일 다운로드 외에 추가로 필요한 출력 형식이 있습니까? (예: PDF, 슬라이드 미리보기 이미지)
-
-**Q7. 평가 제출 방식**  
-코드를 GitHub 저장소로 제출합니까, 로컬 실행 패키지로 제출합니까?  
-→ GitHub 제출이라면 README 작성 범위도 설계에 포함합니다.
+**다음 단계**: SPEC.md 최종 승인 → Phase 0 환경 설정 시작
 
 ---
 
-*SPEC.md 작성 완료. 위 미결 질문 검토 후 승인해 주시면 구현을 시작합니다.*
+*SPEC.md 확정판. 승인 후 구현을 시작합니다.*
